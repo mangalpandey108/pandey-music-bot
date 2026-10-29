@@ -1,0 +1,5 @@
+﻿pyrogrammod==2.4.1
+py-tgcalls==3.0.0
+ntgcalls==3.0.5
+yt-dlp
+tgcrypto

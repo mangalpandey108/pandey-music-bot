@@ -1,0 +1,12 @@
+botenv/
+__pycache__/
+*.pyc
+*.session
+*.session-*
+*.session.*
+.env
+check_token.py
+venv/
+**/venv/
+user_session.py
+main_before_user_session.py
