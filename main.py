@@ -2,6 +2,7 @@
 import os
 import asyncio
 import traceback
+import time
 import requests
 import yt_dlp
 
@@ -38,9 +39,9 @@ calls = None
 
 queues = defaultdict(deque)
 current_songs = {}
-
-# एक Chat में एक समय पर केवल एक Playback Start
 playback_starting = set()
+
+http = requests.Session()
 
 
 # ---------------- YOUTUBE SEARCH ----------------
@@ -50,7 +51,9 @@ def search_youtube(query):
     if not YOUTUBE_API_KEY:
         raise ValueError("YOUTUBE_API_KEY .env में नहीं मिली।")
 
-    response = requests.get(
+    start = time.perf_counter()
+
+    response = http.get(
         "https://www.googleapis.com/youtube/v3/search",
         params={
             "part": "snippet",
@@ -59,13 +62,16 @@ def search_youtube(query):
             "maxResults": 1,
             "key": YOUTUBE_API_KEY
         },
-        timeout=20
+        timeout=(5, 10)
     )
 
     response.raise_for_status()
     data = response.json()
 
     items = data.get("items", [])
+
+    elapsed = time.perf_counter() - start
+    print(f"🔎 YouTube Search Time: {elapsed:.2f}s")
 
     if not items:
         return None
@@ -83,12 +89,19 @@ def search_youtube(query):
 
 def extract_audio_url(video_url):
 
+    start = time.perf_counter()
+
     options = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[acodec!=none]/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "skip_download": True
+        "skip_download": True,
+        "socket_timeout": 10,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+        "cachedir": False
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
@@ -106,7 +119,10 @@ def extract_audio_url(video_url):
         if not audio_url:
             raise ValueError("Direct Audio URL नहीं मिला।")
 
-        return audio_url
+    elapsed = time.perf_counter() - start
+    print(f"⚡ Audio Extraction Time: {elapsed:.2f}s")
+
+    return audio_url
 
 
 # ---------------- PLAY NEXT ----------------
@@ -128,6 +144,8 @@ async def play_next(chat_id):
 
         song = queues[chat_id].popleft()
 
+        start = time.perf_counter()
+
         audio_url = await asyncio.to_thread(
             extract_audio_url,
             song["url"]
@@ -142,6 +160,9 @@ async def play_next(chat_id):
         )
 
         current_songs[chat_id] = song
+
+        elapsed = time.perf_counter() - start
+        print(f"🎵 Playback Start Time: {elapsed:.2f}s")
 
         await bot.send_message(
             chat_id,
@@ -219,6 +240,8 @@ async def play_command(client, message):
 
     try:
 
+        start = time.perf_counter()
+
         song = await asyncio.to_thread(
             search_youtube,
             query
@@ -227,6 +250,10 @@ async def play_command(client, message):
         if not song:
             await status.edit_text("❌ कोई गाना नहीं मिला।")
             return
+
+        search_elapsed = time.perf_counter() - start
+
+        print(f"🔎 Total Search Time: {search_elapsed:.2f}s")
 
         chat_id = message.chat.id
 
@@ -246,12 +273,16 @@ async def play_command(client, message):
         queues[chat_id].append(song)
 
         await status.edit_text(
-            f"▶️ गाना चलाने की कोशिश:\n{song['title']}"
+            f"⚡ Audio तैयार किया जा रहा है:\n{song['title']}"
         )
 
         success = await play_next(chat_id)
 
-        if not success:
+        if success:
+            await status.edit_text(
+                f"🎵 Playing:\n{song['title']}"
+            )
+        else:
             await status.edit_text(
                 "❌ गाना नहीं चल पाया। Console Error जाँचें।"
             )
@@ -275,9 +306,7 @@ async def play_command(client, message):
 async def pause_command(client, message):
 
     try:
-
         await calls.pause(message.chat.id)
-
         await message.reply_text("⏸️ गाना रोक दिया गया।")
 
     except Exception as error:
@@ -293,9 +322,7 @@ async def pause_command(client, message):
 async def resume_command(client, message):
 
     try:
-
         await calls.resume(message.chat.id)
-
         await message.reply_text("▶️ गाना फिर शुरू हो गया।")
 
     except Exception as error:
@@ -401,7 +428,6 @@ async def main():
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
     print("Event Loop:", id(asyncio.get_running_loop()))
 
-    # Clients इसी Running Loop के अंदर बनाए जाएँगे
     bot = Client(
         "PandeyMusicBot",
         api_id=API_ID,
@@ -417,7 +443,6 @@ async def main():
 
     calls = PyTgCalls(user)
 
-    # Bot Handlers
     bot.add_handler(MessageHandler(start_command, filters.command("start")))
     bot.add_handler(MessageHandler(play_command, filters.command("play")))
     bot.add_handler(MessageHandler(pause_command, filters.command("pause")))
@@ -426,7 +451,6 @@ async def main():
     bot.add_handler(MessageHandler(stop_command, filters.command("stop")))
     bot.add_handler(MessageHandler(queue_command, filters.command("queue")))
 
-    # Voice Chat Stream Handler
     calls.on_update(call_filters.stream_end())(stream_ended_handler)
 
     try:
@@ -452,7 +476,7 @@ async def main():
 
         print("✅ PyTgCalls Started")
         print("🎵 Pandey Music Bot Online!")
-        print("🌐 Multi-Group Queue Enabled!")
+        print("⚡ Optimized Playback Enabled!")
 
         await asyncio.Event().wait()
 
@@ -474,6 +498,8 @@ async def main():
             await bot.stop()
         except Exception:
             pass
+
+        http.close()
 
 
 # ---------------- RUN ----------------
