@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import traceback
@@ -144,12 +143,16 @@ async def play_next(chat_id):
 
         song = queues[chat_id].popleft()
 
-        start = time.perf_counter()
+        total_start = time.perf_counter()
 
+        # Audio extraction timing
         audio_url = await asyncio.to_thread(
             extract_audio_url,
             song["url"]
         )
+
+        # Voice Chat startup timing
+        vc_start = time.perf_counter()
 
         await calls.play(
             chat_id,
@@ -159,10 +162,20 @@ async def play_next(chat_id):
             )
         )
 
+        vc_elapsed = time.perf_counter() - vc_start
+
+        print(
+            f"📡 VC Startup Time: {vc_elapsed:.2f}s"
+        )
+
         current_songs[chat_id] = song
 
-        elapsed = time.perf_counter() - start
-        print(f"🎵 Playback Start Time: {elapsed:.2f}s")
+        total_elapsed = time.perf_counter() - total_start
+
+        print(
+            f"🎵 Total Playback Start Time: "
+            f"{total_elapsed:.2f}s"
+        )
 
         await bot.send_message(
             chat_id,
@@ -253,7 +266,10 @@ async def play_command(client, message):
 
         search_elapsed = time.perf_counter() - start
 
-        print(f"🔎 Total Search Time: {search_elapsed:.2f}s")
+        print(
+            f"🔎 Total Search Time: "
+            f"{search_elapsed:.2f}s"
+        )
 
         chat_id = message.chat.id
 
@@ -443,15 +459,37 @@ async def main():
 
     calls = PyTgCalls(user)
 
-    bot.add_handler(MessageHandler(start_command, filters.command("start")))
-    bot.add_handler(MessageHandler(play_command, filters.command("play")))
-    bot.add_handler(MessageHandler(pause_command, filters.command("pause")))
-    bot.add_handler(MessageHandler(resume_command, filters.command("resume")))
-    bot.add_handler(MessageHandler(skip_command, filters.command("skip")))
-    bot.add_handler(MessageHandler(stop_command, filters.command("stop")))
-    bot.add_handler(MessageHandler(queue_command, filters.command("queue")))
+    bot.add_handler(
+        MessageHandler(start_command, filters.command("start"))
+    )
 
-    calls.on_update(call_filters.stream_end())(stream_ended_handler)
+    bot.add_handler(
+        MessageHandler(play_command, filters.command("play"))
+    )
+
+    bot.add_handler(
+        MessageHandler(pause_command, filters.command("pause"))
+    )
+
+    bot.add_handler(
+        MessageHandler(resume_command, filters.command("resume"))
+    )
+
+    bot.add_handler(
+        MessageHandler(skip_command, filters.command("skip"))
+    )
+
+    bot.add_handler(
+        MessageHandler(stop_command, filters.command("stop"))
+    )
+
+    bot.add_handler(
+        MessageHandler(queue_command, filters.command("queue"))
+    )
+
+    calls.on_update(
+        call_filters.stream_end()
+    )(stream_ended_handler)
 
     try:
 
@@ -476,7 +514,7 @@ async def main():
 
         print("✅ PyTgCalls Started")
         print("🎵 Pandey Music Bot Online!")
-        print("⚡ Optimized Playback Enabled!")
+        print("⚡ Playback Timing Enabled!")
 
         await asyncio.Event().wait()
 
