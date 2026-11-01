@@ -2,14 +2,14 @@
 import os
 import asyncio
 import requests
+import yt_dlp
 
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters
 from pytgcalls import PyTgCalls, filters as call_filters
-from pytgcalls.types import MediaStream, AudioQuality
-from pytgcalls.types import StreamEnded
+from pytgcalls.types import MediaStream, AudioQuality, StreamEnded
 
 
 # ---------------- CONFIG ----------------
@@ -22,9 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
-    raise ValueError(
-        "API_ID, API_HASH और BOT_TOKEN .env में जाँचें।"
-    )
+    raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
 
 API_ID = int(API_ID_TEXT)
 
@@ -47,7 +45,7 @@ user = Client(
 calls = PyTgCalls(user)
 
 
-# ---------------- GROUP QUEUES ----------------
+# ---------------- QUEUES ----------------
 
 queues = defaultdict(deque)
 current_songs = {}
@@ -83,13 +81,42 @@ def search_youtube(query):
 
     item = items[0]
 
+    video_id = item["id"]["videoId"]
+
     return {
         "title": item["snippet"]["title"],
-        "url": (
-            "https://www.youtube.com/watch?v="
-            + item["id"]["videoId"]
-        )
+        "url": f"https://www.youtube.com/watch?v={video_id}"
     }
+
+
+# ---------------- EXTRACT AUDIO ----------------
+
+def extract_audio_url(video_url):
+
+    options = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+
+        info = ydl.extract_info(
+            video_url,
+            download=False
+        )
+
+        if not info:
+            raise ValueError("Audio जानकारी नहीं मिली।")
+
+        audio_url = info.get("url")
+
+        if not audio_url:
+            raise ValueError("Direct Audio URL नहीं मिला।")
+
+        return audio_url
 
 
 # ---------------- PLAY NEXT ----------------
@@ -105,10 +132,16 @@ async def play_next(chat_id):
         song = queues[chat_id].popleft()
 
         try:
+
+            audio_url = await asyncio.to_thread(
+                extract_audio_url,
+                song["url"]
+            )
+
             await calls.play(
                 chat_id,
                 MediaStream(
-                    song["url"],
+                    audio_url,
                     AudioQuality.HIGH
                 )
             )
@@ -124,16 +157,13 @@ async def play_next(chat_id):
 
         except Exception as error:
 
-            print(
-                f"Play Error in Group {chat_id}: {error}"
-            )
+            print(f"Play Error in Group {chat_id}: {type(error).__name__}: {error}")
 
             current_songs.pop(chat_id, None)
 
             await bot.send_message(
                 chat_id,
-                "❌ गाना चलाने में समस्या आई। "
-                "Voice Chat और Audio Stream जाँचें।"
+                "❌ गाना नहीं चल पाया। Console में Error जाँचें।"
             )
 
             return False
@@ -150,7 +180,6 @@ async def stream_ended_handler(_, update: StreamEnded):
 
     if queues[chat_id]:
         await play_next(chat_id)
-
     else:
         await bot.send_message(
             chat_id,
@@ -158,7 +187,7 @@ async def stream_ended_handler(_, update: StreamEnded):
         )
 
 
-# ---------------- START COMMAND ----------------
+# ---------------- START ----------------
 
 @bot.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -175,23 +204,18 @@ async def start_command(client, message):
     )
 
 
-# ---------------- PLAY COMMAND ----------------
+# ---------------- PLAY ----------------
 
 @bot.on_message(filters.command("play"))
 async def play_command(client, message):
 
     if len(message.command) < 2:
-
-        await message.reply_text(
-            "उदाहरण: /play Kesariya"
-        )
+        await message.reply_text("उदाहरण: /play Kesariya")
         return
 
     query = " ".join(message.command[1:])
 
-    status = await message.reply_text(
-        "🔎 गाना खोज रहा हूँ..."
-    )
+    status = await message.reply_text("🔎 गाना खोज रहा हूँ...")
 
     try:
 
@@ -201,10 +225,7 @@ async def play_command(client, message):
         )
 
         if not song:
-
-            await status.edit_text(
-                "❌ कोई गाना नहीं मिला।"
-            )
+            await status.edit_text("❌ कोई गाना नहीं मिला।")
             return
 
         chat_id = message.chat.id
@@ -227,22 +248,21 @@ async def play_command(client, message):
             queues[chat_id].appendleft(song)
 
         await status.edit_text(
-            f"▶️ गाना चलाने की कोशिश:\n"
-            f"{song['title']}"
+            f"▶️ गाना चलाने की कोशिश:\n{song['title']}"
         )
 
         success = await play_next(chat_id)
 
         if not success:
-
             await status.edit_text(
-                "❌ गाना नहीं चल पाया। "
-                "Voice Chat और Audio Stream जाँचें।"
+                "❌ गाना नहीं चल पाया। Console Error जाँचें।"
             )
 
     except Exception as error:
 
-        print("Play Command Error:", error)
+        print(
+            f"Play Command Error: {type(error).__name__}: {error}"
+        )
 
         await status.edit_text(
             "❌ गाना खोजने या चलाने में समस्या आई।"
@@ -258,17 +278,13 @@ async def pause_command(client, message):
 
         await calls.pause(message.chat.id)
 
-        await message.reply_text(
-            "⏸️ गाना रोक दिया गया।"
-        )
+        await message.reply_text("⏸️ गाना रोक दिया गया।")
 
     except Exception as error:
 
-        print("Pause Error:", error)
+        print(f"Pause Error: {error}")
 
-        await message.reply_text(
-            "❌ गाना Pause नहीं हुआ।"
-        )
+        await message.reply_text("❌ गाना Pause नहीं हुआ।")
 
 
 # ---------------- RESUME ----------------
@@ -280,17 +296,13 @@ async def resume_command(client, message):
 
         await calls.resume(message.chat.id)
 
-        await message.reply_text(
-            "▶️ गाना फिर शुरू हो गया।"
-        )
+        await message.reply_text("▶️ गाना फिर शुरू हो गया।")
 
     except Exception as error:
 
-        print("Resume Error:", error)
+        print(f"Resume Error: {error}")
 
-        await message.reply_text(
-            "❌ गाना Resume नहीं हुआ।"
-        )
+        await message.reply_text("❌ गाना Resume नहीं हुआ।")
 
 
 # ---------------- SKIP ----------------
@@ -309,14 +321,13 @@ async def skip_command(client, message):
         success = await play_next(chat_id)
 
         if not success:
-
             await message.reply_text(
                 "📭 Queue में अगला गाना नहीं है।"
             )
 
     except Exception as error:
 
-        print("Skip Error:", error)
+        print(f"Skip Error: {error}")
 
         await message.reply_text(
             "❌ Skip करने में समस्या आई।"
@@ -334,7 +345,7 @@ async def stop_command(client, message):
         await calls.leave_call(chat_id)
 
     except Exception as error:
-        print("Stop Error:", error)
+        print(f"Stop Error: {error}")
 
     current_songs.pop(chat_id, None)
     queues[chat_id].clear()
@@ -355,16 +366,12 @@ async def queue_command(client, message):
     upcoming = list(queues[chat_id])
 
     if not current and not upcoming:
-
-        await message.reply_text(
-            "📭 Queue खाली है।"
-        )
+        await message.reply_text("📭 Queue खाली है।")
         return
 
     queue_text = "🎵 **Music Queue**\n\n"
 
     if current:
-
         queue_text += (
             f"▶️ अभी बज रहा है:\n"
             f"{current['title']}\n\n"
@@ -374,17 +381,10 @@ async def queue_command(client, message):
 
         queue_text += "आने वाले गाने:\n"
 
-        for index, song in enumerate(
-            upcoming[:20],
-            start=1
-        ):
-
-            queue_text += (
-                f"{index}. {song['title']}\n"
-            )
+        for index, song in enumerate(upcoming[:20], start=1):
+            queue_text += f"{index}. {song['title']}\n"
 
         if len(upcoming) > 20:
-
             queue_text += (
                 f"\nऔर {len(upcoming) - 20} "
                 "गाने Queue में हैं।"
