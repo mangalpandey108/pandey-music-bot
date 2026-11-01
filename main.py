@@ -1,10 +1,19 @@
 
 import os
+import asyncio
 import requests
-from dotenv import load_dotenv
-from pyrogram import Client, filters
 
-# Load variables from .env file
+from collections import defaultdict, deque
+from dotenv import load_dotenv
+
+from pyrogram import Client, filters
+from pytgcalls import PyTgCalls, filters as call_filters
+from pytgcalls.types import MediaStream, AudioQuality
+from pytgcalls.types import StreamEnded
+
+
+# ---------------- CONFIG ----------------
+
 load_dotenv("/home/container/.env")
 
 API_ID_TEXT = os.getenv("API_ID", "").strip()
@@ -12,18 +21,12 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-print("========== CONFIG CHECK ==========")
-print("API_ID मौजूद:", API_ID_TEXT.isdigit())
-print("API_HASH मौजूद:", bool(API_HASH))
-print("BOT_TOKEN मौजूद:", bool(BOT_TOKEN))
-print("YOUTUBE_API_KEY मौजूद:", bool(YOUTUBE_API_KEY))
-print("==================================")
-
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
-    raise ValueError("अपनी .env file में Telegram credentials जाँचें।")
+    raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
 
 API_ID = int(API_ID_TEXT)
 
+# Bot commands संभालेगा
 bot = Client(
     "PandeyMusicBot",
     api_id=API_ID,
@@ -31,61 +34,303 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
+# User account Voice Chat में गाना चलाएगा
+user = Client(
+    "UserSession",
+    api_id=API_ID,
+    api_hash=API_HASH
+)
+
+calls = PyTgCalls(user)
+
+# हर Group की अलग Queue
+queues = defaultdict(deque)
+current_songs = {}
+chat_locks = defaultdict(asyncio.Lock)
+
+
+# ---------------- YOUTUBE SEARCH ----------------
+
+def search_youtube(query):
+    if not YOUTUBE_API_KEY:
+        raise ValueError("YOUTUBE_API_KEY .env में नहीं मिली।")
+
+    response = requests.get(
+        "https://www.googleapis.com/youtube/v3/search",
+        params={
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": 1,
+            "key": YOUTUBE_API_KEY
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    items = data.get("items", [])
+    if not items:
+        return None
+
+    item = items[0]
+
+    return {
+        "title": item["snippet"]["title"],
+        "url": "https://www.youtube.com/watch?v="
+               + item["id"]["videoId"]
+    }
+
+
+# ---------------- PLAY SONG ----------------
+
+async def play_next(chat_id):
+    async with chat_locks[chat_id]:
+
+        if not queues[chat_id]:
+            current_songs.pop(chat_id, None)
+            return False
+
+        song = queues[chat_id].popleft()
+
+        try:
+            await calls.play(
+                chat_id,
+                MediaStream(
+                    song["url"],
+                    AudioQuality.HIGH
+                )
+            )
+
+            current_songs[chat_id] = song
+            await bot.send_message(
+                chat_id,
+                f"🎵 अब बज रहा है:\n{song['title']}"
+            )
+            return True
+
+        except Exception as error:
+            print(f"Play Error in {chat_id}: {error}")
+
+            await bot.send_message(
+                chat_id,
+                "❌ गाना चलाने में समस्या आई। "
+                "Voice Chat और User Session जाँचें।"
+            )
+
+            current_songs.pop(chat_id, None)
+            return False
+
+
+# ---------------- AUTOMATIC NEXT SONG ----------------
+
+@calls.on_update(call_filters.stream_end())
+async def stream_ended_handler(_, update: StreamEnded):
+    chat_id = update.chat_id
+
+    current_songs.pop(chat_id, None)
+
+    if queues[chat_id]:
+        await play_next(chat_id)
+    else:
+        await bot.send_message(
+            chat_id,
+            "🎵 Queue समाप्त हो गई।"
+        )
+
+
+# ---------------- START ----------------
 
 @bot.on_message(filters.command("start"))
 async def start_command(client, message):
     await message.reply_text(
         "🎵 Pandey Music Bot ऑनलाइन है!\n\n"
-        "गाना खोजने के लिए:\n"
-        "/play Kesariya"
+        "Commands:\n"
+        "/play गाने का नाम\n"
+        "/pause - गाना रोकें\n"
+        "/resume - गाना फिर चलाएँ\n"
+        "/skip - अगला गाना\n"
+        "/stop - Playback बंद करें\n"
+        "/queue - Queue देखें"
     )
 
 
+# ---------------- PLAY COMMAND ----------------
+
 @bot.on_message(filters.command("play"))
 async def play_command(client, message):
-    if not YOUTUBE_API_KEY:
-        await message.reply_text("YouTube API Key सेट नहीं है।")
-        return
 
     if len(message.command) < 2:
-        await message.reply_text("उदाहरण: /play Kesariya")
+        await message.reply_text(
+            "उदाहरण: /play Kesariya"
+        )
         return
 
     query = " ".join(message.command[1:])
 
-    try:
-        response = requests.get(
-            "https://www.googleapis.com/youtube/v3/search",
-            params={
-                "part": "snippet",
-                "q": query,
-                "type": "video",
-                "maxResults": 5,
-                "key": YOUTUBE_API_KEY
-            },
-            timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
+    status = await message.reply_text(
+        "🔎 गाना खोज रहा हूँ..."
+    )
 
-        results = []
-        for item in data.get("items", []):
-            video_id = item["id"]["videoId"]
-            title = item["snippet"]["title"]
-            results.append(
-                f"🎵 {title}\n"
-                f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        song = await asyncio.to_thread(
+            search_youtube, query
+        )
+
+        if not song:
+            await status.edit_text(
+                "❌ कोई गाना नहीं मिला।"
+            )
+            return
+
+        chat_id = message.chat.id
+
+        async with chat_locks[chat_id]:
+            if chat_id in current_songs:
+                queues[chat_id].append(song)
+                position = len(queues[chat_id])
+                await status.edit_text(
+                    f"✅ Queue में जोड़ा गया:\n"
+                    f"{song['title']}\n"
+                    f"स्थान: {position}"
+                )
+                return
+
+            queues[chat_id].appendleft(song)
+
+        await status.edit_text(
+            f"▶️ गाना चलाने की कोशिश:\n{song['title']}"
+        )
+
+        success = await play_next(chat_id)
+
+        if not success:
+            await status.edit_text(
+                "❌ गाना नहीं चल पाया। "
+                "Voice Chat और User Session जाँचें।"
             )
 
-        await message.reply_text(
-            "\n\n".join(results) if results else "कोई वीडियो नहीं मिला।"
+    except Exception as error:
+        print("Play Command Error:", error)
+        await status.edit_text(
+            "❌ गाना खोजने या चलाने में समस्या आई।"
         )
 
-    except requests.RequestException as error:
-        print("YouTube API Error:", error)
-        await message.reply_text("YouTube Search में समस्या आई।")
+
+# ---------------- PAUSE ----------------
+
+@bot.on_message(filters.command("pause"))
+async def pause_command(client, message):
+    try:
+        await calls.pause(message.chat.id)
+        await message.reply_text("⏸️ गाना रोक दिया गया।")
+    except Exception as error:
+        print("Pause Error:", error)
+        await message.reply_text("❌ गाना Pause नहीं हुआ।")
+
+
+# ---------------- RESUME ----------------
+
+@bot.on_message(filters.command("resume"))
+async def resume_command(client, message):
+    try:
+        await calls.resume(message.chat.id)
+        await message.reply_text("▶️ गाना फिर शुरू हो गया।")
+    except Exception as error:
+        print("Resume Error:", error)
+        await message.reply_text("❌ गाना Resume नहीं हुआ।")
+
+
+# ---------------- SKIP ----------------
+
+@bot.on_message(filters.command("skip"))
+async def skip_command(client, message):
+    chat_id = message.chat.id
+
+    try:
+        await calls.leave_call(chat_id)
+        current_songs.pop(chat_id, None)
+
+        success = await play_next(chat_id)
+
+        if not success:
+            await message.reply_text(
+                "📭 Queue में अगला गाना नहीं है।"
+            )
+
+    except Exception as error:
+        print("Skip Error:", error)
+        await message.reply_text("❌ Skip करने में समस्या आई।")
+
+
+# ---------------- STOP ----------------
+
+@bot.on_message(filters.command("stop"))
+async def stop_command(client, message):
+    chat_id = message.chat.id
+
+    try:
+        await calls.leave_call(chat_id)
+    except Exception as error:
+        print("Stop Error:", error)
+
+    current_songs.pop(chat_id, None)
+    queues[chat_id].clear()
+
+    await message.reply_text(
+        "⏹️ Playback बंद और Queue खाली कर दी गई।"
+    )
+
+
+# ---------------- QUEUE ----------------
+
+@bot.on_message(filters.command("queue"))
+async def queue_command(client, message):
+    chat_id = message.chat.id
+
+    current = current_songs.get(chat_id)
+    upcoming = list(queues[chat_id])
+
+    if not current and not upcoming:
+        await message.reply_text("📭 Queue खाली है।")
+        return
+
+    text = "🎵 **Music Queue**\n\n"
+
+    if current:
+        text += f"▶️ अभी बज रहा है:\n{current['title']}\n\n"
+
+    if upcoming:
+        text += "आने वाले गाने:\n"
+        for index, song in enumerate(upcoming[:20], start=1):
+            text += f"{index}. {song['title']}\n"
+
+        if len(upcoming) > 20:
+            text += f"\nऔर {len(upcoming) - 20} गाने Queue में हैं।"
+
+    await message.reply_text(text)
+
+
+# ---------------- MAIN ----------------
+
+async def main():
+    print("🤖 Pandey Music Bot शुरू हो रहा है...")
+
+    await bot.start()
+    print("✅ Bot Client Started")
+
+    await user.start()
+    print("✅ User Session Started")
+
+    calls.start()
+    print("✅ PyTgCalls Started")
+
+    print("🎵 Pandey Music Bot Online!")
+    print("🌐 Multi-Group Queue Enabled!")
+
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    print("🤖 Pandey Music Bot शुरू हो रहा है...")
-    bot.run()
+    asyncio.run(main())
