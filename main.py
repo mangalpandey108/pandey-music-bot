@@ -1,4 +1,3 @@
-```python
 import os
 import asyncio
 import requests
@@ -42,7 +41,6 @@ user = Client(
     api_hash=API_HASH
 )
 
-# Voice Chat हमेशा User Client से चलेगा
 calls = PyTgCalls(user)
 
 
@@ -73,9 +71,8 @@ def search_youtube(query):
     )
 
     response.raise_for_status()
-    data = response.json()
 
-    items = data.get("items", [])
+    items = response.json().get("items", [])
 
     if not items:
         return None
@@ -403,28 +400,29 @@ async def main():
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
 
-    # Bot Client Start
+    # Start Bot Client
     await bot.start()
     print("✅ Bot Client Started")
 
-    # User Client Start
+    # Start User Client
     await user.start()
 
     me = await user.get_me()
 
-    print("✅ User Session Started")
-    print("👤 Account Name:", me.first_name)
-    print("🆔 Account ID:", me.id)
-    print("🤖 Is Bot Account?:", me.is_bot)
+    print("--------------------------------")
+    print("SESSION ACCOUNT:", me.first_name)
+    print("SESSION USER ID:", me.id)
+    print("SESSION IS BOT:", me.is_bot)
+    print("--------------------------------")
 
-    # Bot account को User Session के रूप में स्वीकार नहीं करेंगे
+    # User Session must be a normal user account
     if me.is_bot:
         raise RuntimeError(
             "UserSession में Bot Account का session है। "
             "सामान्य Telegram User Account का session इस्तेमाल करें।"
         )
 
-    # PyTgCalls Start
+    # Start Voice Calls
     await calls.start()
 
     print("✅ PyTgCalls Started")
@@ -437,5 +435,7 @@ async def main():
 # ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    asyncio.run(main())
-```
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot बंद किया गया।")
