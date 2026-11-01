@@ -1,4 +1,3 @@
-```python
 import os
 import asyncio
 import traceback
@@ -39,7 +38,10 @@ calls = None
 
 queues = defaultdict(deque)
 current_songs = {}
+
 playback_starting = set()
+skip_in_progress = set()
+stop_in_progress = set()
 
 http = requests.Session()
 
@@ -197,10 +199,13 @@ async def play_next(chat_id):
 
         current_songs.pop(chat_id, None)
 
-        await bot.send_message(
-            chat_id,
-            "❌ गाना नहीं चल पाया। Console Error जाँचें।"
-        )
+        try:
+            await bot.send_message(
+                chat_id,
+                "❌ गाना नहीं चल पाया। Console Error जाँचें।"
+            )
+        except Exception:
+            traceback.print_exc()
 
         return False
 
@@ -215,6 +220,11 @@ async def stream_ended_handler(_, update: StreamEnded):
     chat_id = update.chat_id
 
     print(f"🏁 STREAM ENDED: {chat_id}")
+
+    # Manual skip या stop के दौरान अगला गाना अपने-आप शुरू न करें।
+    if chat_id in skip_in_progress or chat_id in stop_in_progress:
+        print(f"⏭️ Manual action in progress: {chat_id}")
+        return
 
     current_songs.pop(chat_id, None)
 
@@ -280,7 +290,11 @@ async def play_command(client, message):
 
         chat_id = message.chat.id
 
-        if chat_id in current_songs or chat_id in playback_starting:
+        if (
+            chat_id in current_songs
+            or chat_id in playback_starting
+            or chat_id in skip_in_progress
+        ):
 
             queues[chat_id].append(song)
 
@@ -296,4 +310,354 @@ async def play_command(client, message):
         queues[chat_id].append(song)
 
         await status.edit_text(
-            f"⚡ Audio तैयार किया जा रहा है:\n{song
+            f"⚡ Audio तैयार किया जा रहा है:\n"
+            f"{song['title']}"
+        )
+
+        success = await play_next(chat_id)
+
+        if not success:
+            await status.edit_text(
+                "❌ गाना शुरू नहीं हो पाया। Console Error जाँचें।"
+            )
+        else:
+            await status.delete()
+
+    except Exception as error:
+
+        print(f"❌ PLAY COMMAND ERROR: {error}")
+        traceback.print_exc()
+
+        await status.edit_text(
+            "❌ गाना खोजने या चलाने में समस्या हुई।"
+        )
+
+
+# ---------------- PAUSE COMMAND ----------------
+
+async def pause_command(client, message):
+
+    print("🟡 PAUSE COMMAND RECEIVED")
+
+    chat_id = message.chat.id
+
+    try:
+
+        if chat_id not in current_songs:
+            await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+            return
+
+        await calls.pause_stream(chat_id)
+
+        print(f"⏸️ PAUSED: {chat_id}")
+
+        await message.reply_text("⏸️ गाना रोक दिया गया है।")
+
+    except Exception as error:
+
+        print(f"❌ PAUSE ERROR: {error}")
+        traceback.print_exc()
+
+        await message.reply_text(
+            f"❌ Pause Error: {type(error).__name__}"
+        )
+
+
+# ---------------- RESUME COMMAND ----------------
+
+async def resume_command(client, message):
+
+    print("🟢 RESUME COMMAND RECEIVED")
+
+    chat_id = message.chat.id
+
+    try:
+
+        if chat_id not in current_songs:
+            await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+            return
+
+        await calls.resume_stream(chat_id)
+
+        print(f"▶️ RESUMED: {chat_id}")
+
+        await message.reply_text("▶️ गाना फिर से शुरू हो गया है।")
+
+    except Exception as error:
+
+        print(f"❌ RESUME ERROR: {error}")
+        traceback.print_exc()
+
+        await message.reply_text(
+            f"❌ Resume Error: {type(error).__name__}"
+        )
+
+
+# ---------------- SKIP COMMAND ----------------
+
+async def skip_command(client, message):
+
+    print("⏭️ SKIP COMMAND RECEIVED")
+
+    chat_id = message.chat.id
+
+    if chat_id in skip_in_progress:
+        await message.reply_text("⏳ Skip पहले से चल रहा है।")
+        return
+
+    if chat_id not in current_songs:
+        await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+        return
+
+    skip_in_progress.add(chat_id)
+
+    try:
+
+        await calls.leave_call(chat_id)
+
+        current_songs.pop(chat_id, None)
+
+        if queues[chat_id]:
+            await message.reply_text("⏭️ अगला गाना शुरू किया जा रहा है।")
+        else:
+            await message.reply_text("📭 Queue खाली है।")
+
+    except Exception as error:
+
+        print(f"❌ SKIP ERROR: {error}")
+        traceback.print_exc()
+
+        await message.reply_text(
+            f"❌ Skip Error: {type(error).__name__}"
+        )
+
+    finally:
+        skip_in_progress.discard(chat_id)
+
+    if queues[chat_id]:
+        await play_next(chat_id)
+
+
+# ---------------- STOP COMMAND ----------------
+
+async def stop_command(client, message):
+
+    print("🔴 STOP COMMAND RECEIVED")
+
+    chat_id = message.chat.id
+
+    stop_in_progress.add(chat_id)
+
+    try:
+
+        queues[chat_id].clear()
+        current_songs.pop(chat_id, None)
+
+        await calls.leave_call(chat_id)
+
+        print(f"⏹️ STOPPED: {chat_id}")
+
+        await message.reply_text(
+            "⏹️ Playback बंद कर दिया गया है और Queue साफ कर दी गई है।"
+        )
+
+    except Exception as error:
+
+        print(f"❌ STOP ERROR: {error}")
+        traceback.print_exc()
+
+        await message.reply_text(
+            f"❌ Stop Error: {type(error).__name__}"
+        )
+
+    finally:
+        stop_in_progress.discard(chat_id)
+
+
+# ---------------- END COMMAND ----------------
+
+async def end_command(client, message):
+
+    print("🔴 END COMMAND RECEIVED")
+
+    chat_id = message.chat.id
+
+    stop_in_progress.add(chat_id)
+
+    try:
+
+        queues[chat_id].clear()
+        current_songs.pop(chat_id, None)
+
+        await calls.leave_call(chat_id)
+
+        print(f"🔚 ENDED: {chat_id}")
+
+        await message.reply_text(
+            "🔚 Playback समाप्त कर दिया गया है।"
+        )
+
+    except Exception as error:
+
+        print(f"❌ END ERROR: {error}")
+        traceback.print_exc()
+
+        await message.reply_text(
+            f"❌ End Error: {type(error).__name__}"
+        )
+
+    finally:
+        stop_in_progress.discard(chat_id)
+
+
+# ---------------- QUEUE COMMAND ----------------
+
+async def queue_command(client, message):
+
+    print("📋 QUEUE COMMAND RECEIVED")
+
+    chat_id = message.chat.id
+
+    try:
+
+        queue = queues[chat_id]
+        current = current_songs.get(chat_id)
+
+        if not current and not queue:
+            await message.reply_text("📭 Queue खाली है।")
+            return
+
+        text = "🎵 **Music Queue**\n\n"
+
+        if current:
+            text += f"▶️ **अभी बज रहा है:**\n{current['title']}\n\n"
+
+        if queue:
+            text += "📋 **आने वाले गाने:**\n"
+
+            for number, song in enumerate(list(queue)[:10], start=1):
+                text += f"{number}. {song['title']}\n"
+
+            if len(queue) > 10:
+                text += f"\nऔर {len(queue) - 10} गाने बाकी हैं।"
+
+        await message.reply_text(text)
+
+    except Exception as error:
+
+        print(f"❌ QUEUE ERROR: {error}")
+        traceback.print_exc()
+
+        await message.reply_text("❌ Queue दिखाने में समस्या हुई।")
+
+
+# ---------------- MAIN ----------------
+
+async def main():
+
+    global bot, user, calls
+
+    print("🤖 Pandey Music Bot शुरू हो रहा है...")
+    print(f"Event Loop: {id(asyncio.get_running_loop())}")
+
+    bot = Client(
+        "PandeyMusicBot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
+    )
+
+    user = Client(
+        "UserSession",
+        api_id=API_ID,
+        api_hash=API_HASH
+    )
+
+    calls = PyTgCalls(user)
+
+    handlers = [
+        ("start", start_command),
+        ("play", play_command),
+        ("pause", pause_command),
+        ("resume", resume_command),
+        ("skip", skip_command),
+        ("stop", stop_command),
+        ("end", end_command),
+        ("queue", queue_command)
+    ]
+
+    try:
+
+        await bot.start()
+        print("✅ Bot Client Started")
+
+        await user.start()
+        print("✅ User Session Started")
+
+        me = await user.get_me()
+
+        print(f"👤 Account Name: {me.first_name}")
+        print(f"🆔 Account ID: {me.id}")
+        print(f"🤖 Is Bot Account?: {me.is_bot}")
+
+        if me.is_bot:
+            raise RuntimeError(
+                "UserSession में Bot Account का session है। "
+                "Normal User Account का session इस्तेमाल करें।"
+            )
+
+        await calls.start()
+        print("✅ PyTgCalls Started")
+
+        calls.on_update(
+            call_filters.stream_end()
+        )(stream_ended_handler)
+
+        for command_name, callback in handlers:
+
+            bot.add_handler(
+                MessageHandler(
+                    callback,
+                    filters.command(command_name)
+                )
+            )
+
+            print(f"✅ Handler Registered: /{command_name}")
+
+        print("🎵 Pandey Music Bot Online!")
+        print("🌐 Multi-Group Queue Enabled!")
+
+        await asyncio.Event().wait()
+
+    except Exception as error:
+
+        print(f"❌ MAIN ERROR: {error}")
+        traceback.print_exc()
+
+        raise
+
+    finally:
+
+        print("🛑 Bot बंद हो रहा है...")
+
+        try:
+            if calls:
+                await calls.stop()
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            if user and user.is_connected:
+                await user.stop()
+        except Exception:
+            traceback.print_exc()
+
+        try:
+            if bot and bot.is_connected:
+                await bot.stop()
+        except Exception:
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
