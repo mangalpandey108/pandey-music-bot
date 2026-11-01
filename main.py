@@ -1,5 +1,7 @@
+
 import os
 import asyncio
+import traceback
 import requests
 import yt_dlp
 
@@ -7,6 +9,8 @@ from collections import defaultdict, deque
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters
+from pyrogram.handlers import MessageHandler
+
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import MediaStream, AudioQuality, StreamEnded
 
@@ -26,29 +30,17 @@ if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
 API_ID = int(API_ID_TEXT)
 
 
-# ---------------- CLIENTS ----------------
+# ---------------- GLOBALS ----------------
 
-bot = Client(
-    "PandeyMusicBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
-
-user = Client(
-    "UserSession",
-    api_id=API_ID,
-    api_hash=API_HASH
-)
-
-calls = PyTgCalls(user)
-
-
-# ---------------- QUEUES ----------------
+bot = None
+user = None
+calls = None
 
 queues = defaultdict(deque)
 current_songs = {}
-chat_locks = defaultdict(asyncio.Lock)
+
+# एक Chat में एक समय पर केवल एक Playback Start
+playback_starting = set()
 
 
 # ---------------- YOUTUBE SEARCH ----------------
@@ -71,8 +63,9 @@ def search_youtube(query):
     )
 
     response.raise_for_status()
+    data = response.json()
 
-    items = response.json().get("items", [])
+    items = data.get("items", [])
 
     if not items:
         return None
@@ -120,7 +113,14 @@ def extract_audio_url(video_url):
 
 async def play_next(chat_id):
 
-    async with chat_locks[chat_id]:
+    global calls, bot
+
+    if chat_id in playback_starting:
+        return False
+
+    playback_starting.add(chat_id)
+
+    try:
 
         if not queues[chat_id]:
             current_songs.pop(chat_id, None)
@@ -128,50 +128,52 @@ async def play_next(chat_id):
 
         song = queues[chat_id].popleft()
 
-        try:
+        audio_url = await asyncio.to_thread(
+            extract_audio_url,
+            song["url"]
+        )
 
-            audio_url = await asyncio.to_thread(
-                extract_audio_url,
-                song["url"]
+        await calls.play(
+            chat_id,
+            MediaStream(
+                audio_url,
+                AudioQuality.HIGH
             )
+        )
 
-            await calls.play(
-                chat_id,
-                MediaStream(
-                    audio_url,
-                    AudioQuality.HIGH
-                )
-            )
+        current_songs[chat_id] = song
 
-            current_songs[chat_id] = song
+        await bot.send_message(
+            chat_id,
+            f"🎵 अब बज रहा है:\n{song['title']}"
+        )
 
-            await bot.send_message(
-                chat_id,
-                f"🎵 अब बज रहा है:\n{song['title']}"
-            )
+        return True
 
-            return True
+    except Exception as error:
 
-        except Exception as error:
+        print(
+            f"Play Error in Group {chat_id}: "
+            f"{type(error).__name__}: {error}"
+        )
 
-            print(
-                f"Play Error in Group {chat_id}: "
-                f"{type(error).__name__}: {error}"
-            )
+        traceback.print_exc()
 
-            current_songs.pop(chat_id, None)
+        current_songs.pop(chat_id, None)
 
-            await bot.send_message(
-                chat_id,
-                "❌ गाना नहीं चल पाया। Console में Error जाँचें।"
-            )
+        await bot.send_message(
+            chat_id,
+            "❌ गाना नहीं चल पाया। Console Error जाँचें।"
+        )
 
-            return False
+        return False
+
+    finally:
+        playback_starting.discard(chat_id)
 
 
 # ---------------- STREAM END ----------------
 
-@calls.on_update(call_filters.stream_end())
 async def stream_ended_handler(_, update: StreamEnded):
 
     chat_id = update.chat_id
@@ -189,7 +191,6 @@ async def stream_ended_handler(_, update: StreamEnded):
 
 # ---------------- START COMMAND ----------------
 
-@bot.on_message(filters.command("start"))
 async def start_command(client, message):
 
     await message.reply_text(
@@ -206,7 +207,6 @@ async def start_command(client, message):
 
 # ---------------- PLAY COMMAND ----------------
 
-@bot.on_message(filters.command("play"))
 async def play_command(client, message):
 
     if len(message.command) < 2:
@@ -230,22 +230,20 @@ async def play_command(client, message):
 
         chat_id = message.chat.id
 
-        async with chat_locks[chat_id]:
+        if chat_id in current_songs or chat_id in playback_starting:
 
-            if chat_id in current_songs:
+            queues[chat_id].append(song)
 
-                queues[chat_id].append(song)
+            position = len(queues[chat_id])
 
-                position = len(queues[chat_id])
+            await status.edit_text(
+                f"✅ Queue में जोड़ा गया:\n"
+                f"{song['title']}\n"
+                f"स्थान: {position}"
+            )
+            return
 
-                await status.edit_text(
-                    f"✅ Queue में जोड़ा गया:\n"
-                    f"{song['title']}\n"
-                    f"स्थान: {position}"
-                )
-                return
-
-            queues[chat_id].appendleft(song)
+        queues[chat_id].append(song)
 
         await status.edit_text(
             f"▶️ गाना चलाने की कोशिश:\n{song['title']}"
@@ -265,6 +263,8 @@ async def play_command(client, message):
             f"{type(error).__name__}: {error}"
         )
 
+        traceback.print_exc()
+
         await status.edit_text(
             "❌ गाना खोजने या चलाने में समस्या आई।"
         )
@@ -272,7 +272,6 @@ async def play_command(client, message):
 
 # ---------------- PAUSE COMMAND ----------------
 
-@bot.on_message(filters.command("pause"))
 async def pause_command(client, message):
 
     try:
@@ -284,13 +283,13 @@ async def pause_command(client, message):
     except Exception as error:
 
         print(f"Pause Error: {error}")
+        traceback.print_exc()
 
         await message.reply_text("❌ गाना Pause नहीं हुआ।")
 
 
 # ---------------- RESUME COMMAND ----------------
 
-@bot.on_message(filters.command("resume"))
 async def resume_command(client, message):
 
     try:
@@ -302,13 +301,13 @@ async def resume_command(client, message):
     except Exception as error:
 
         print(f"Resume Error: {error}")
+        traceback.print_exc()
 
         await message.reply_text("❌ गाना Resume नहीं हुआ।")
 
 
 # ---------------- SKIP COMMAND ----------------
 
-@bot.on_message(filters.command("skip"))
 async def skip_command(client, message):
 
     chat_id = message.chat.id
@@ -329,6 +328,7 @@ async def skip_command(client, message):
     except Exception as error:
 
         print(f"Skip Error: {error}")
+        traceback.print_exc()
 
         await message.reply_text(
             "❌ Skip करने में समस्या आई।"
@@ -337,7 +337,6 @@ async def skip_command(client, message):
 
 # ---------------- STOP COMMAND ----------------
 
-@bot.on_message(filters.command("stop"))
 async def stop_command(client, message):
 
     chat_id = message.chat.id
@@ -358,7 +357,6 @@ async def stop_command(client, message):
 
 # ---------------- QUEUE COMMAND ----------------
 
-@bot.on_message(filters.command("queue"))
 async def queue_command(client, message):
 
     chat_id = message.chat.id
@@ -398,44 +396,87 @@ async def queue_command(client, message):
 
 async def main():
 
+    global bot, user, calls
+
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
+    print("Event Loop:", id(asyncio.get_running_loop()))
 
-    # Start Bot Client
-    await bot.start()
-    print("✅ Bot Client Started")
+    # Clients इसी Running Loop के अंदर बनाए जाएँगे
+    bot = Client(
+        "PandeyMusicBot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
+    )
 
-    # Start User Client
-    await user.start()
+    user = Client(
+        "UserSession",
+        api_id=API_ID,
+        api_hash=API_HASH
+    )
 
-    me = await user.get_me()
+    calls = PyTgCalls(user)
 
-    print("--------------------------------")
-    print("SESSION ACCOUNT:", me.first_name)
-    print("SESSION USER ID:", me.id)
-    print("SESSION IS BOT:", me.is_bot)
-    print("--------------------------------")
+    # Bot Handlers
+    bot.add_handler(MessageHandler(start_command, filters.command("start")))
+    bot.add_handler(MessageHandler(play_command, filters.command("play")))
+    bot.add_handler(MessageHandler(pause_command, filters.command("pause")))
+    bot.add_handler(MessageHandler(resume_command, filters.command("resume")))
+    bot.add_handler(MessageHandler(skip_command, filters.command("skip")))
+    bot.add_handler(MessageHandler(stop_command, filters.command("stop")))
+    bot.add_handler(MessageHandler(queue_command, filters.command("queue")))
 
-    # User Session must be a normal user account
-    if me.is_bot:
-        raise RuntimeError(
-            "UserSession में Bot Account का session है। "
-            "सामान्य Telegram User Account का session इस्तेमाल करें।"
-        )
+    # Voice Chat Stream Handler
+    calls.on_update(call_filters.stream_end())(stream_ended_handler)
 
-    # Start Voice Calls
-    await calls.start()
+    try:
 
-    print("✅ PyTgCalls Started")
-    print("🎵 Pandey Music Bot Online!")
-    print("🌐 Multi-Group Queue Enabled!")
+        await bot.start()
+        print("✅ Bot Client Started")
 
-    await asyncio.Event().wait()
+        await user.start()
+
+        me = await user.get_me()
+
+        print("✅ User Session Started")
+        print("👤 Account Name:", me.first_name)
+        print("🆔 Account ID:", me.id)
+        print("🤖 Is Bot Account?:", me.is_bot)
+
+        if me.is_bot:
+            raise RuntimeError(
+                "UserSession में सामान्य Telegram User Account का Session लगाएँ।"
+            )
+
+        await calls.start()
+
+        print("✅ PyTgCalls Started")
+        print("🎵 Pandey Music Bot Online!")
+        print("🌐 Multi-Group Queue Enabled!")
+
+        await asyncio.Event().wait()
+
+    finally:
+
+        print("🛑 Bot बंद हो रहा है...")
+
+        try:
+            await calls.stop()
+        except Exception:
+            pass
+
+        try:
+            await user.stop()
+        except Exception:
+            pass
+
+        try:
+            await bot.stop()
+        except Exception:
+            pass
 
 
 # ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bot बंद किया गया।")
+    asyncio.run(main())
