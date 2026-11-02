@@ -3,7 +3,6 @@ import os
 import asyncio
 import traceback
 import time
-import shutil
 import requests
 import yt_dlp
 
@@ -17,7 +16,7 @@ from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import MediaStream, AudioQuality, StreamEnded
 
 
-# ---------------- CONFIG ----------------
+# ================= CONFIG =================
 
 load_dotenv("/home/container/.env")
 
@@ -32,7 +31,7 @@ if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
 API_ID = int(API_ID_TEXT)
 
 
-# ---------------- GLOBALS ----------------
+# ================= GLOBALS =================
 
 bot = None
 user = None
@@ -48,14 +47,14 @@ stop_in_progress = set()
 http = requests.Session()
 
 
-# ---------------- YOUTUBE SEARCH ----------------
+# ================= YOUTUBE SEARCH =================
 
 def search_youtube(query):
 
     if not YOUTUBE_API_KEY:
         raise ValueError("YOUTUBE_API_KEY .env में नहीं मिली।")
 
-    start = time.perf_counter()
+    started = time.perf_counter()
 
     response = http.get(
         "https://www.googleapis.com/youtube/v3/search",
@@ -70,13 +69,12 @@ def search_youtube(query):
     )
 
     response.raise_for_status()
-    data = response.json()
 
-    items = data.get("items", [])
+    items = response.json().get("items", [])
 
     print(
         f"🔎 YouTube Search Time: "
-        f"{time.perf_counter() - start:.2f}s"
+        f"{time.perf_counter() - started:.2f}s"
     )
 
     if not items:
@@ -91,14 +89,13 @@ def search_youtube(query):
     }
 
 
-# ---------------- EXTRACT AUDIO ----------------
+# ================= AUDIO EXTRACTION =================
 
 def extract_audio_url(video_url):
 
-    start = time.perf_counter()
+    started = time.perf_counter()
 
     options = {
-        # YouTube से केवल audio format चुनें; video डाउनलोड नहीं होगा।
         "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": False,
@@ -108,120 +105,146 @@ def extract_audio_url(video_url):
         "retries": 2,
         "extractor_retries": 2,
         "fragment_retries": 2,
-        "cachedir": False,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["default"]
-            }
-        }
+        "cachedir": False
     }
 
-    # Node.js उपलब्ध हो तो yt-dlp को JavaScript runtime दें।
-    # Node.js न होने पर yt-dlp अपने उपलब्ध तरीके से कोशिश करेगा।
-    node_path = shutil.which("node")
-    if node_path:
-        options["js_runtimes"] = {
-            "node": {"path": node_path}
-        }
-        print(f"✅ YouTube JS Runtime: Node.js ({node_path})")
-    else:
-        print("⚠️ Node.js नहीं मिला; yt-dlp बिना Node.js के कोशिश करेगा।")
-
     with yt_dlp.YoutubeDL(options) as ydl:
-
         info = ydl.extract_info(
             video_url,
             download=False
         )
 
-        if not info:
-            raise ValueError("Audio जानकारी नहीं मिली।")
+    if not info:
+        raise ValueError("Audio information नहीं मिली।")
 
-        audio_url = info.get("url")
+    audio_url = info.get("url")
 
-        if not audio_url:
-            raise ValueError("Direct Audio URL नहीं मिला।")
+    if not audio_url:
+
+        formats = info.get("formats") or []
+
+        audio_formats = [
+            item for item in formats
+            if item.get("url")
+            and item.get("acodec") not in (None, "none")
+        ]
+
+        if audio_formats:
+
+            audio_formats.sort(
+                key=lambda item: (
+                    item.get("abr") or 0,
+                    item.get("tbr") or 0
+                ),
+                reverse=True
+            )
+
+            audio_url = audio_formats[0]["url"]
+
+    if not audio_url:
+        raise ValueError("Direct Audio URL उपलब्ध नहीं है।")
 
     print(
         f"⚡ Audio Extraction Time: "
-        f"{time.perf_counter() - start:.2f}s"
+        f"{time.perf_counter() - started:.2f}s"
     )
 
     return audio_url
 
 
-# ---------------- PLAY NEXT ----------------
+# ================= PLAY NEXT =================
 
 async def play_next(chat_id):
 
-    global calls, bot
-
     if chat_id in playback_starting:
-        print(f"⏳ Playback already starting: {chat_id}")
+        print(f"⏳ Playback पहले से शुरू हो रहा है: {chat_id}")
         return False
 
     playback_starting.add(chat_id)
 
     try:
 
-        if not queues[chat_id]:
-            current_songs.pop(chat_id, None)
-            print(f"📭 Queue Empty: {chat_id}")
-            return False
+        while queues[chat_id]:
 
-        song = queues[chat_id].popleft()
+            if chat_id in stop_in_progress:
+                return False
 
-        total_start = time.perf_counter()
+            song = queues[chat_id].popleft()
 
-        audio_url = await asyncio.to_thread(
-            extract_audio_url,
-            song["url"]
-        )
+            started = time.perf_counter()
 
-        vc_start = time.perf_counter()
+            try:
 
-        await calls.play(
-            chat_id,
-            MediaStream(
-                audio_url,
-                AudioQuality.HIGH
-            )
-        )
+                print(f"🎧 Trying: {song['title']}")
 
-        print(
-            f"📡 VC Startup Time: "
-            f"{time.perf_counter() - vc_start:.2f}s"
-        )
+                audio_url = await asyncio.to_thread(
+                    extract_audio_url,
+                    song["url"]
+                )
 
-        current_songs[chat_id] = song
+                vc_started = time.perf_counter()
 
-        print(
-            f"🎵 Total Playback Start Time: "
-            f"{time.perf_counter() - total_start:.2f}s"
-        )
+                await calls.play(
+                    chat_id,
+                    MediaStream(
+                        audio_url,
+                        AudioQuality.HIGH
+                    )
+                )
 
-        await bot.send_message(
-            chat_id,
-            f"🎵 अब बज रहा है:\n{song['title']}"
-        )
+                print(
+                    f"📡 VC Startup Time: "
+                    f"{time.perf_counter() - vc_started:.2f}s"
+                )
 
-        return True
+                current_songs[chat_id] = song
 
-    except Exception as error:
+                print(
+                    f"🎵 Total Playback Start Time: "
+                    f"{time.perf_counter() - started:.2f}s"
+                )
 
-        print(
-            f"❌ Play Error in Group {chat_id}: "
-            f"{type(error).__name__}: {error}"
-        )
+                await bot.send_message(
+                    chat_id,
+                    f"🎵 अब बज रहा है:\n{song['title']}"
+                )
 
-        traceback.print_exc()
+                return True
+
+            except Exception as error:
+
+                current_songs.pop(chat_id, None)
+
+                print(
+                    f"❌ Song Failed: {song.get('title')}"
+                )
+
+                print(
+                    f"Error: {type(error).__name__}: {error}"
+                )
+
+                traceback.print_exc()
+
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        "⚠️ यह गाना उपलब्ध नहीं हो पाया:\n"
+                        f"{song.get('title', 'Unknown')}\n"
+                        "Queue का अगला गाना Try कर रहा हूँ।"
+                    )
+                except Exception:
+                    traceback.print_exc()
+
+                # अगला गाना while loop में Try होगा।
 
         current_songs.pop(chat_id, None)
+
+        print(f"📭 Queue Empty: {chat_id}")
 
         try:
             await bot.send_message(
                 chat_id,
-                "❌ गाना नहीं चल पाया। Console Error जाँचें।"
+                "❌ Queue के गाने शुरू नहीं हो पाए या Queue खाली है।"
             )
         except Exception:
             traceback.print_exc()
@@ -232,7 +255,7 @@ async def play_next(chat_id):
         playback_starting.discard(chat_id)
 
 
-# ---------------- STREAM END ----------------
+# ================= STREAM END =================
 
 async def stream_ended_handler(_, update: StreamEnded):
 
@@ -240,8 +263,10 @@ async def stream_ended_handler(_, update: StreamEnded):
 
     print(f"🏁 STREAM ENDED: {chat_id}")
 
-    if chat_id in skip_in_progress or chat_id in stop_in_progress:
-        print(f"⏭️ Manual action in progress: {chat_id}")
+    if chat_id in skip_in_progress:
+        return
+
+    if chat_id in stop_in_progress:
         return
 
     current_songs.pop(chat_id, None)
@@ -255,11 +280,9 @@ async def stream_ended_handler(_, update: StreamEnded):
         )
 
 
-# ---------------- START COMMAND ----------------
+# ================= START COMMAND =================
 
 async def start_command(client, message):
-
-    print("🟢 START COMMAND RECEIVED")
 
     await message.reply_text(
         "🎵 Pandey Music Bot ऑनलाइन है!\n\n"
@@ -274,39 +297,47 @@ async def start_command(client, message):
     )
 
 
-# ---------------- PLAY COMMAND ----------------
+# ================= PLAY COMMAND =================
 
 async def play_command(client, message):
 
     print("🎵 PLAY COMMAND RECEIVED")
 
     if len(message.command) < 2:
-        await message.reply_text("उदाहरण: /play Kesariya")
+        await message.reply_text(
+            "उदाहरण: /play Kesariya"
+        )
         return
 
     query = " ".join(message.command[1:])
 
-    status = await message.reply_text("🔎 गाना खोज रहा हूँ...")
+    status = await message.reply_text(
+        "🔎 गाना खोज रहा हूँ..."
+    )
 
     try:
 
-        start = time.perf_counter()
+        started = time.perf_counter()
 
         song = await asyncio.to_thread(
             search_youtube,
             query
         )
 
-        if not song:
-            await status.edit_text("❌ कोई गाना नहीं मिला।")
-            return
-
         print(
             f"🔎 Total Search Time: "
-            f"{time.perf_counter() - start:.2f}s"
+            f"{time.perf_counter() - started:.2f}s"
         )
 
+        if not song:
+            await status.edit_text(
+                "❌ कोई गाना नहीं मिला।"
+            )
+            return
+
         chat_id = message.chat.id
+
+        queues[chat_id].append(song)
 
         if (
             chat_id in current_songs
@@ -314,62 +345,64 @@ async def play_command(client, message):
             or chat_id in skip_in_progress
         ):
 
-            queues[chat_id].append(song)
-
-            position = len(queues[chat_id])
-
             await status.edit_text(
                 f"✅ Queue में जोड़ा गया:\n"
                 f"{song['title']}\n"
-                f"स्थान: {position}"
+                f"स्थान: {len(queues[chat_id])}"
             )
+
             return
 
-        queues[chat_id].append(song)
-
         await status.edit_text(
-            f"⚡ Audio तैयार किया जा रहा है:\n"
-            f"{song['title']}"
+            f"⚡ Audio तैयार किया जा रहा है:\n{song['title']}"
         )
 
         success = await play_next(chat_id)
 
-        if not success:
-            await status.edit_text(
-                "❌ गाना शुरू नहीं हो पाया। Console Error जाँचें।"
-            )
-        else:
+        if success:
             await status.delete()
+        else:
+            await status.edit_text(
+                "❌ Queue का कोई गाना शुरू नहीं हो पाया। "
+                "Console में Error देखें।"
+            )
 
     except Exception as error:
 
-        print(f"❌ PLAY COMMAND ERROR: {error}")
-        traceback.print_exc()
-
-        await status.edit_text(
-            "❌ गाना खोजने या चलाने में समस्या हुई।"
+        print(
+            f"❌ PLAY ERROR: "
+            f"{type(error).__name__}: {error}"
         )
 
+        traceback.print_exc()
 
-# ---------------- PAUSE COMMAND ----------------
+        try:
+            await status.edit_text(
+                "❌ गाना खोजने या चलाने में समस्या हुई।"
+            )
+        except Exception:
+            traceback.print_exc()
+
+
+# ================= PAUSE COMMAND =================
 
 async def pause_command(client, message):
-
-    print("🟡 PAUSE COMMAND RECEIVED")
 
     chat_id = message.chat.id
 
     try:
 
         if chat_id not in current_songs:
-            await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+            await message.reply_text(
+                "❌ अभी कोई गाना नहीं चल रहा है।"
+            )
             return
 
         await calls.pause_stream(chat_id)
 
-        print(f"⏸️ PAUSED: {chat_id}")
-
-        await message.reply_text("⏸️ गाना रोक दिया गया है।")
+        await message.reply_text(
+            "⏸️ गाना रोक दिया गया है।"
+        )
 
     except Exception as error:
 
@@ -381,25 +414,25 @@ async def pause_command(client, message):
         )
 
 
-# ---------------- RESUME COMMAND ----------------
+# ================= RESUME COMMAND =================
 
 async def resume_command(client, message):
-
-    print("🟢 RESUME COMMAND RECEIVED")
 
     chat_id = message.chat.id
 
     try:
 
         if chat_id not in current_songs:
-            await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+            await message.reply_text(
+                "❌ अभी कोई गाना नहीं चल रहा है।"
+            )
             return
 
         await calls.resume_stream(chat_id)
 
-        print(f"▶️ RESUMED: {chat_id}")
-
-        await message.reply_text("▶️ गाना फिर से शुरू हो गया है।")
+        await message.reply_text(
+            "▶️ गाना फिर शुरू हो गया है।"
+        )
 
     except Exception as error:
 
@@ -411,20 +444,22 @@ async def resume_command(client, message):
         )
 
 
-# ---------------- SKIP COMMAND ----------------
+# ================= SKIP COMMAND =================
 
 async def skip_command(client, message):
-
-    print("⏭️ SKIP COMMAND RECEIVED")
 
     chat_id = message.chat.id
 
     if chat_id in skip_in_progress:
-        await message.reply_text("⏳ Skip पहले से चल रहा है।")
+        await message.reply_text(
+            "⏳ Skip पहले से चल रहा है।"
+        )
         return
 
     if chat_id not in current_songs:
-        await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+        await message.reply_text(
+            "❌ अभी कोई गाना नहीं चल रहा है।"
+        )
         return
 
     skip_in_progress.add(chat_id)
@@ -435,10 +470,9 @@ async def skip_command(client, message):
 
         current_songs.pop(chat_id, None)
 
-        if queues[chat_id]:
-            await message.reply_text("⏭️ अगला गाना शुरू किया जा रहा है।")
-        else:
-            await message.reply_text("📭 Queue खाली है।")
+        await message.reply_text(
+            "⏭️ अगला गाना शुरू किया जा रहा है।"
+        )
 
     except Exception as error:
 
@@ -449,18 +483,22 @@ async def skip_command(client, message):
             f"❌ Skip Error: {type(error).__name__}"
         )
 
+        return
+
     finally:
         skip_in_progress.discard(chat_id)
 
     if queues[chat_id]:
         await play_next(chat_id)
+    else:
+        await message.reply_text(
+            "📭 Queue खाली है।"
+        )
 
 
-# ---------------- STOP COMMAND ----------------
+# ================= STOP COMMAND =================
 
 async def stop_command(client, message):
-
-    print("🔴 STOP COMMAND RECEIVED")
 
     chat_id = message.chat.id
 
@@ -473,10 +511,8 @@ async def stop_command(client, message):
 
         await calls.leave_call(chat_id)
 
-        print(f"⏹️ STOPPED: {chat_id}")
-
         await message.reply_text(
-            "⏹️ Playback बंद कर दिया गया है और Queue साफ कर दी गई है।"
+            "⏹️ Playback बंद और Queue साफ कर दी गई है।"
         )
 
     except Exception as error:
@@ -492,91 +528,62 @@ async def stop_command(client, message):
         stop_in_progress.discard(chat_id)
 
 
-# ---------------- END COMMAND ----------------
+# ================= END COMMAND =================
 
 async def end_command(client, message):
 
-    print("🔴 END COMMAND RECEIVED")
-
-    chat_id = message.chat.id
-
-    stop_in_progress.add(chat_id)
-
-    try:
-
-        queues[chat_id].clear()
-        current_songs.pop(chat_id, None)
-
-        await calls.leave_call(chat_id)
-
-        print(f"🔚 ENDED: {chat_id}")
-
-        await message.reply_text(
-            "🔚 Playback समाप्त कर दिया गया है।"
-        )
-
-    except Exception as error:
-
-        print(f"❌ END ERROR: {error}")
-        traceback.print_exc()
-
-        await message.reply_text(
-            f"❌ End Error: {type(error).__name__}"
-        )
-
-    finally:
-        stop_in_progress.discard(chat_id)
+    await stop_command(client, message)
 
 
-# ---------------- QUEUE COMMAND ----------------
+# ================= QUEUE COMMAND =================
 
 async def queue_command(client, message):
 
-    print("📋 QUEUE COMMAND RECEIVED")
-
     chat_id = message.chat.id
 
-    try:
+    queue = queues[chat_id]
+    current = current_songs.get(chat_id)
 
-        queue = queues[chat_id]
-        current = current_songs.get(chat_id)
+    if not current and not queue:
+        await message.reply_text(
+            "📭 Queue खाली है।"
+        )
+        return
 
-        if not current and not queue:
-            await message.reply_text("📭 Queue खाली है।")
-            return
+    text = "🎵 **Music Queue**\n\n"
 
-        text = "🎵 **Music Queue**\n\n"
+    if current:
 
-        if current:
-            text += f"▶️ **अभी बज रहा है:**\n{current['title']}\n\n"
+        text += (
+            f"▶️ **अभी बज रहा है:**\n"
+            f"{current['title']}\n\n"
+        )
 
-        if queue:
-            text += "📋 **आने वाले गाने:**\n"
+    if queue:
 
-            for number, song in enumerate(list(queue)[:10], start=1):
-                text += f"{number}. {song['title']}\n"
+        text += "📋 **आने वाले गाने:**\n"
 
-            if len(queue) > 10:
-                text += f"\nऔर {len(queue) - 10} गाने बाकी हैं।"
+        for number, song in enumerate(
+            list(queue)[:10],
+            start=1
+        ):
+            text += f"{number}. {song['title']}\n"
 
-        await message.reply_text(text)
+        if len(queue) > 10:
+            text += (
+                f"\nऔर {len(queue) - 10} गाने बाकी हैं।"
+            )
 
-    except Exception as error:
-
-        print(f"❌ QUEUE ERROR: {error}")
-        traceback.print_exc()
-
-        await message.reply_text("❌ Queue दिखाने में समस्या हुई।")
+    await message.reply_text(text)
 
 
-# ---------------- MAIN ----------------
+# ================= MAIN =================
 
 async def main():
 
     global bot, user, calls
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
-    print(f"Event Loop: {id(asyncio.get_running_loop())}")
 
     bot = Client(
         "PandeyMusicBot",
@@ -585,7 +592,6 @@ async def main():
         bot_token=BOT_TOKEN
     )
 
-    # नई FreshLogin session इस्तेमाल होगी
     user = Client(
         "FreshLogin",
         api_id=API_ID,
@@ -622,7 +628,7 @@ async def main():
         if me.is_bot:
             raise RuntimeError(
                 "FreshLogin में Bot Account का session है। "
-                "Normal User Account का session इस्तेमाल करें।"
+                "Normal User Account का session आवश्यक है।"
             )
 
         await calls.start()
@@ -641,26 +647,29 @@ async def main():
                 )
             )
 
-            print(f"✅ Handler Registered: /{command_name}")
+            print(
+                f"✅ Handler Registered: /{command_name}"
+            )
 
         print("🎵 Pandey Music Bot Online!")
         print("🌐 Multi-Group Queue Enabled!")
+        print("⏭️ Failed song पर अगला queued song Try होगा।")
 
         await asyncio.Event().wait()
 
     except Exception as error:
 
-        print(f"❌ MAIN ERROR: {error}")
-        traceback.print_exc()
+        print(
+            f"❌ MAIN ERROR: "
+            f"{type(error).__name__}: {error}"
+        )
 
+        traceback.print_exc()
         raise
 
     finally:
 
         print("🛑 Bot बंद हो रहा है...")
-
-        # इस PyTgCalls version में calls.stop() उपलब्ध नहीं है।
-        # पहले User Client और फिर Bot Client बंद करें।
 
         try:
             if user and user.is_connected:
