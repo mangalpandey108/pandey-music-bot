@@ -1,5 +1,6 @@
-pyrogrammod==2.4.1
-py-tgcalls==3.0.0
+pyrogrammod>=2.1.2
+py-tgcalls==2.2.11
+yt-dlp[default]
 python-dotenv
 requests
-yt-dlp
+TgCrypto
