@@ -6,6 +6,7 @@ import time
 import requests
 import yt_dlp
 
+from pathlib import Path
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 
@@ -25,10 +26,15 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+SONGS_DIR = Path("/home/container/songs").resolve()
+
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
     raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
 
 API_ID = int(API_ID_TEXT)
+
+# Songs folder मौजूद न हो तो बना दें।
+SONGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ================= GLOBALS =================
@@ -46,6 +52,59 @@ stop_in_progress = set()
 failed_chats = set()
 
 http = requests.Session()
+
+
+# ================= LOCAL SONGS =================
+
+def get_local_songs():
+
+    if not SONGS_DIR.exists():
+        return []
+
+    return sorted(
+        [
+            file for file in SONGS_DIR.iterdir()
+            if file.is_file() and file.suffix.lower() == ".mp3"
+        ],
+        key=lambda file: file.name.casefold()
+    )
+
+
+def find_local_song(query):
+
+    query = query.strip().casefold()
+
+    if not query:
+        return None, []
+
+    songs = get_local_songs()
+
+    # पहले exact filename या filename stem मिलाएँ।
+    exact_matches = [
+        file for file in songs
+        if file.name.casefold() == query
+        or file.stem.casefold() == query
+    ]
+
+    if len(exact_matches) == 1:
+        return exact_matches[0], []
+
+    if len(exact_matches) > 1:
+        return None, exact_matches
+
+    # Exact match नहीं मिला तो unique partial match देखें।
+    partial_matches = [
+        file for file in songs
+        if query in file.stem.casefold()
+    ]
+
+    if len(partial_matches) == 1:
+        return partial_matches[0], []
+
+    if len(partial_matches) > 1:
+        return None, partial_matches
+
+    return None, []
 
 
 # ================= YOUTUBE SEARCH =================
@@ -86,7 +145,8 @@ def search_youtube(query):
 
     return {
         "title": item["snippet"]["title"],
-        "url": f"https://www.youtube.com/watch?v={video_id}"
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "source": "youtube"
     }
 
 
@@ -178,17 +238,31 @@ async def play_next(chat_id):
 
         print(f"🎧 Trying: {song['title']}")
 
-        audio_url = await asyncio.to_thread(
-            extract_audio_url,
-            song["url"]
-        )
+        # Local MP3 या YouTube Audio
+        if song.get("source") == "local":
+
+            audio_input = song["path"]
+
+            if not os.path.isfile(audio_input):
+                raise FileNotFoundError(
+                    f"Local MP3 नहीं मिली: {audio_input}"
+                )
+
+            print(f"📁 Local MP3: {audio_input}")
+
+        else:
+
+            audio_input = await asyncio.to_thread(
+                extract_audio_url,
+                song["url"]
+            )
 
         vc_started = time.perf_counter()
 
         await calls.play(
             chat_id,
             MediaStream(
-                audio_url,
+                audio_input,
                 AudioQuality.HIGH
             )
         )
@@ -280,7 +354,8 @@ async def start_command(client, message):
         "/skip - अगला गाना\n"
         "/stop - Playback बंद करें\n"
         "/end - Playback समाप्त करें\n"
-        "/queue - Queue देखें"
+        "/queue - Queue देखें\n\n"
+        "📁 Local MP3 के लिए /play लिखें।"
     )
 
 
@@ -290,39 +365,88 @@ async def play_command(client, message):
 
     print("🎵 PLAY COMMAND RECEIVED")
 
+    chat_id = message.chat.id
+
+    # बिना query के Local MP3 की सूची दिखाएँ।
     if len(message.command) < 2:
-        await message.reply_text(
-            "उदाहरण: /play Kesariya"
-        )
+
+        songs = get_local_songs()
+
+        if not songs:
+            await message.reply_text(
+                "📂 songs फ़ोल्डर खाली है।\n"
+                "पहले उसमें MP3 फ़ाइल अपलोड करें।"
+            )
+            return
+
+        text = "📁 **Available Local Songs:**\n\n"
+
+        for number, file in enumerate(songs[:20], start=1):
+            text += f"{number}. {file.name}\n"
+
+        text += "\nगाना चलाने के लिए:\n/play गाने का नाम"
+
+        await message.reply_text(text)
         return
 
-    query = " ".join(message.command[1:])
+    query = " ".join(message.command[1:]).strip()
 
     status = await message.reply_text(
-        "🔎 गाना खोज रहा हूँ..."
+        "🔎 Local songs में खोज रहा हूँ..."
     )
 
     try:
 
         started = time.perf_counter()
 
-        song = await asyncio.to_thread(
-            search_youtube,
-            query
-        )
+        local_file, multiple_matches = find_local_song(query)
+
+        # एक से अधिक Local matches हों।
+        if multiple_matches:
+
+            text = "⚠️ एक से अधिक Local गाने मिले:\n\n"
+
+            for file in multiple_matches[:15]:
+                text += f"• {file.name}\n"
+
+            text += "\nकृपया सही filename से /play करें।"
+
+            await status.edit_text(text)
+            return
+
+        # Local MP3 मिल गई।
+        if local_file:
+
+            song = {
+                "title": local_file.stem,
+                "source": "local",
+                "path": str(local_file.resolve())
+            }
+
+            print(f"📁 Local Song Found: {local_file.name}")
+
+        else:
+
+            # Local में नहीं मिली तो YouTube खोजें।
+            await status.edit_text(
+                "🔎 Local song नहीं मिली। YouTube पर खोज रहा हूँ..."
+            )
+
+            song = await asyncio.to_thread(
+                search_youtube,
+                query
+            )
+
+            if not song:
+                await status.edit_text(
+                    "❌ Local या YouTube पर गाना नहीं मिला।"
+                )
+                return
 
         print(
             f"🔎 Total Search Time: "
             f"{time.perf_counter() - started:.2f}s"
         )
-
-        if not song:
-            await status.edit_text(
-                "❌ कोई गाना नहीं मिला।"
-            )
-            return
-
-        chat_id = message.chat.id
 
         queues[chat_id].append(song)
 
@@ -640,7 +764,8 @@ async def main():
             )
 
         print("🎵 Pandey Music Bot Online!")
-        print("🌐 Multi-Group Queue Enabled!")
+        print("📁 Local MP3 Playback Enabled!")
+        print("🌐 YouTube Search Enabled!")
         print("⏭️ Failed song पर auto-next बंद है।")
 
         await asyncio.Event().wait()
