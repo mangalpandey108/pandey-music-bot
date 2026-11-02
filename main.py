@@ -43,6 +43,7 @@ current_songs = {}
 playback_starting = set()
 skip_in_progress = set()
 stop_in_progress = set()
+failed_chats = set()
 
 http = requests.Session()
 
@@ -160,91 +161,74 @@ async def play_next(chat_id):
         print(f"⏳ Playback पहले से शुरू हो रहा है: {chat_id}")
         return False
 
+    if chat_id in stop_in_progress:
+        return False
+
+    if not queues[chat_id]:
+        print(f"📭 Queue Empty: {chat_id}")
+        return False
+
     playback_starting.add(chat_id)
+
+    song = queues[chat_id].popleft()
 
     try:
 
-        while queues[chat_id]:
+        started = time.perf_counter()
 
-            if chat_id in stop_in_progress:
-                return False
+        print(f"🎧 Trying: {song['title']}")
 
-            song = queues[chat_id].popleft()
+        audio_url = await asyncio.to_thread(
+            extract_audio_url,
+            song["url"]
+        )
 
-            started = time.perf_counter()
+        vc_started = time.perf_counter()
 
-            try:
+        await calls.play(
+            chat_id,
+            MediaStream(
+                audio_url,
+                AudioQuality.HIGH
+            )
+        )
 
-                print(f"🎧 Trying: {song['title']}")
+        print(
+            f"📡 VC Startup Time: "
+            f"{time.perf_counter() - vc_started:.2f}s"
+        )
 
-                audio_url = await asyncio.to_thread(
-                    extract_audio_url,
-                    song["url"]
-                )
+        current_songs[chat_id] = song
+        failed_chats.discard(chat_id)
 
-                vc_started = time.perf_counter()
+        print(
+            f"🎵 Total Playback Start Time: "
+            f"{time.perf_counter() - started:.2f}s"
+        )
 
-                await calls.play(
-                    chat_id,
-                    MediaStream(
-                        audio_url,
-                        AudioQuality.HIGH
-                    )
-                )
+        await bot.send_message(
+            chat_id,
+            f"🎵 अब बज रहा है:\n{song['title']}"
+        )
 
-                print(
-                    f"📡 VC Startup Time: "
-                    f"{time.perf_counter() - vc_started:.2f}s"
-                )
+        return True
 
-                current_songs[chat_id] = song
-
-                print(
-                    f"🎵 Total Playback Start Time: "
-                    f"{time.perf_counter() - started:.2f}s"
-                )
-
-                await bot.send_message(
-                    chat_id,
-                    f"🎵 अब बज रहा है:\n{song['title']}"
-                )
-
-                return True
-
-            except Exception as error:
-
-                current_songs.pop(chat_id, None)
-
-                print(
-                    f"❌ Song Failed: {song.get('title')}"
-                )
-
-                print(
-                    f"Error: {type(error).__name__}: {error}"
-                )
-
-                traceback.print_exc()
-
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        "⚠️ यह गाना उपलब्ध नहीं हो पाया:\n"
-                        f"{song.get('title', 'Unknown')}\n"
-                        "Queue का अगला गाना Try कर रहा हूँ।"
-                    )
-                except Exception:
-                    traceback.print_exc()
-
-                # अगला गाना while loop में Try होगा।
+    except Exception as error:
 
         current_songs.pop(chat_id, None)
+        failed_chats.add(chat_id)
 
-        print(f"📭 Queue Empty: {chat_id}")
+        print(f"❌ Song Failed: {song.get('title')}")
+        print(f"Error: {type(error).__name__}: {error}")
+
+        traceback.print_exc()
 
         try:
             await bot.send_message(
                 chat_id,
-                "❌ Queue के गाने शुरू नहीं हो पाए या Queue खाली है।"
+                "❌ यह गाना शुरू नहीं हो पाया:\n"
+                f"{song.get('title', 'Unknown')}\n\n"
+                "अगला गाना अपने-आप नहीं चलाया जाएगा।"
             )
         except Exception:
             traceback.print_exc()
@@ -267,6 +251,9 @@ async def stream_ended_handler(_, update: StreamEnded):
         return
 
     if chat_id in stop_in_progress:
+        return
+
+    if chat_id in failed_chats:
         return
 
     current_songs.pop(chat_id, None)
@@ -363,8 +350,8 @@ async def play_command(client, message):
             await status.delete()
         else:
             await status.edit_text(
-                "❌ Queue का कोई गाना शुरू नहीं हो पाया। "
-                "Console में Error देखें।"
+                "❌ गाना शुरू नहीं हो पाया। "
+                "अगला गाना अपने-आप नहीं चलेगा।"
             )
 
     except Exception as error:
@@ -508,6 +495,7 @@ async def stop_command(client, message):
 
         queues[chat_id].clear()
         current_songs.pop(chat_id, None)
+        failed_chats.discard(chat_id)
 
         await calls.leave_call(chat_id)
 
@@ -653,7 +641,7 @@ async def main():
 
         print("🎵 Pandey Music Bot Online!")
         print("🌐 Multi-Group Queue Enabled!")
-        print("⏭️ Failed song पर अगला queued song Try होगा।")
+        print("⏭️ Failed song पर auto-next बंद है।")
 
         await asyncio.Event().wait()
 
