@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import traceback
@@ -221,7 +222,6 @@ async def stream_ended_handler(_, update: StreamEnded):
 
     print(f"🏁 STREAM ENDED: {chat_id}")
 
-    # Manual skip या stop के दौरान अगला गाना अपने-आप शुरू न करें।
     if chat_id in skip_in_progress or chat_id in stop_in_progress:
         print(f"⏭️ Manual action in progress: {chat_id}")
         return
@@ -567,8 +567,9 @@ async def main():
         bot_token=BOT_TOKEN
     )
 
+    # नई FreshLogin session इस्तेमाल होगी
     user = Client(
-        "UserSession",
+        "FreshLogin",
         api_id=API_ID,
         api_hash=API_HASH
     )
@@ -592,7 +593,7 @@ async def main():
         print("✅ Bot Client Started")
 
         await user.start()
-        print("✅ User Session Started")
+        print("✅ FreshLogin User Session Started")
 
         me = await user.get_me()
 
@@ -602,7 +603,7 @@ async def main():
 
         if me.is_bot:
             raise RuntimeError(
-                "UserSession में Bot Account का session है। "
+                "FreshLogin में Bot Account का session है। "
                 "Normal User Account का session इस्तेमाल करें।"
             )
 
@@ -640,21 +641,20 @@ async def main():
 
         print("🛑 Bot बंद हो रहा है...")
 
-        try:
-            if calls:
-                await calls.stop()
-        except Exception:
-            traceback.print_exc()
+        # इस PyTgCalls version में calls.stop() उपलब्ध नहीं है।
+        # पहले User Client और फिर Bot Client बंद करें।
 
         try:
             if user and user.is_connected:
                 await user.stop()
+                print("✅ User Client Stopped")
         except Exception:
             traceback.print_exc()
 
         try:
             if bot and bot.is_connected:
                 await bot.stop()
+                print("✅ Bot Client Stopped")
         except Exception:
             traceback.print_exc()
 
