@@ -3,6 +3,7 @@ import os
 import asyncio
 import traceback
 import time
+import shutil
 import requests
 import yt_dlp
 
@@ -97,17 +98,34 @@ def extract_audio_url(video_url):
     start = time.perf_counter()
 
     options = {
-        "format": "bestaudio[acodec!=none]/bestaudio/best",
+        # YouTube से केवल audio format चुनें; video डाउनलोड नहीं होगा।
+        "format": "bestaudio/best",
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 10,
-        "retries": 1,
-        "extractor_retries": 1,
-        "fragment_retries": 1,
-        "cachedir": False
+        "socket_timeout": 20,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
+        "cachedir": False,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default"]
+            }
+        }
     }
+
+    # Node.js उपलब्ध हो तो yt-dlp को JavaScript runtime दें।
+    # Node.js न होने पर yt-dlp अपने उपलब्ध तरीके से कोशिश करेगा।
+    node_path = shutil.which("node")
+    if node_path:
+        options["js_runtimes"] = {
+            "node": {"path": node_path}
+        }
+        print(f"✅ YouTube JS Runtime: Node.js ({node_path})")
+    else:
+        print("⚠️ Node.js नहीं मिला; yt-dlp बिना Node.js के कोशिश करेगा।")
 
     with yt_dlp.YoutubeDL(options) as ydl:
 
