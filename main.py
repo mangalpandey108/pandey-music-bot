@@ -19,7 +19,7 @@ from difflib import SequenceMatcher
 from collections import defaultdict, deque
 from dotenv import load_dotenv
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -236,7 +236,7 @@ async def send_now_playing(chat_id, song):
         chat_id,
         text,
         reply_markup=music_buttons(),
-        parse_mode="html"
+        parse_mode=enums.ParseMode.HTML
     )
 
     now_playing_messages[chat_id] = sent
@@ -509,7 +509,15 @@ async def play_next(chat_id):
         current_songs[chat_id] = song
         failed_chats.discard(chat_id)
 
-        await send_now_playing(chat_id, song)
+        try:
+            await send_now_playing(chat_id, song)
+        except Exception as notify_error:
+            # Notification fail होने पर चल रहे audio को failed न मानें।
+            print(
+                "⚠️ Now Playing message भेजने में समस्या हुई: "
+                f"{type(notify_error).__name__}: {notify_error}"
+            )
+            traceback.print_exc()
 
         print(
             f"🎵 Total Playback Start Time: "
