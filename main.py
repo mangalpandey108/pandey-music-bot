@@ -9,6 +9,10 @@ import yt_dlp
 import unicodedata
 import shutil
 import html
+import platform
+import zipfile
+import subprocess
+import stat
 
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -33,6 +37,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 SONGS_DIR = Path("/home/container/songs").resolve()
+DENO_DIR = Path("/home/container/.deno-runtime").resolve()
+DENO_BIN = DENO_DIR / "deno"
 
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
     raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
@@ -41,11 +47,134 @@ API_ID = int(API_ID_TEXT)
 SONGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# ================= DENO AUTO INSTALLER =================
+
+def setup_deno():
+    """
+    Deno की official GitHub release डाउनलोड करके
+    server के writable folder में install करने की कोशिश करता है।
+    """
+
+    existing = shutil.which("deno")
+
+    if existing:
+        print(f"✅ System Deno Found: {existing}")
+        return existing
+
+    if DENO_BIN.exists():
+        try:
+            os.chmod(DENO_BIN, 0o755)
+            result = subprocess.run(
+                [str(DENO_BIN), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+
+            if result.returncode == 0:
+                print("✅ पहले से डाउनलोड किया हुआ Deno मिला।")
+                return str(DENO_BIN)
+
+        except Exception as error:
+            print(f"⚠️ Existing Deno इस्तेमाल नहीं हो सका: {error}")
+
+    machine = platform.machine().lower()
+
+    if machine in ("x86_64", "amd64"):
+        asset_name = "deno-x86_64-unknown-linux-gnu.zip"
+    elif machine in ("aarch64", "arm64"):
+        asset_name = "deno-aarch64-unknown-linux-gnu.zip"
+    else:
+        print(f"❌ Unsupported server architecture: {machine}")
+        return None
+
+    if platform.system().lower() != "linux":
+        print("❌ यह installer Linux server के लिए बनाया गया है।")
+        return None
+
+    zip_path = DENO_DIR / "deno-download.zip"
+
+    try:
+        DENO_DIR.mkdir(parents=True, exist_ok=True)
+
+        download_url = (
+            "https://github.com/denoland/deno/releases/latest/download/"
+            + asset_name
+        )
+
+        print("⬇️ Official Deno download शुरू हो रहा है...")
+
+        response = requests.get(
+            download_url,
+            stream=True,
+            timeout=(15, 120)
+        )
+        response.raise_for_status()
+
+        with open(zip_path, "wb") as file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    file.write(chunk)
+
+        print("📦 Deno ZIP डाउनलोड पूरा हुआ।")
+
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            if "deno" not in archive.namelist():
+                raise RuntimeError("ZIP में Deno executable नहीं मिला।")
+
+            archive.extract("deno", path=DENO_DIR)
+
+        os.chmod(
+            DENO_BIN,
+            stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR |
+            stat.S_IRGRP | stat.S_IXGRP |
+            stat.S_IROTH | stat.S_IXOTH
+        )
+
+        result = subprocess.run(
+            [str(DENO_BIN), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=20
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr or "Deno executable नहीं चल पाया।"
+            )
+
+        os.environ["PATH"] = (
+            str(DENO_DIR) + os.pathsep + os.environ.get("PATH", "")
+        )
+
+        print("✅ Deno Successfully Installed!")
+        print(result.stdout.strip())
+
+        return str(DENO_BIN)
+
+    except Exception as error:
+        print("❌ Deno Auto Installation असफल!")
+        print(f"कारण: {type(error).__name__}: {error}")
+        print(
+            "ℹ️ SillyDev ने download या executable permission "
+            "रोक रखी हो सकती है।"
+        )
+        return None
+
+    finally:
+        try:
+            if zip_path.exists():
+                zip_path.unlink()
+        except Exception:
+            pass
+
+
 # ================= GLOBALS =================
 
 bot = None
 user = None
 calls = None
+DENO_PATH = None
 
 queues = defaultdict(deque)
 current_songs = {}
@@ -84,14 +213,10 @@ def music_buttons():
 def requester_tag(song):
     user_id = song.get("requester_id")
     name = song.get("requester_name") or "Unknown User"
-
     safe_name = html.escape(name)
 
     if user_id:
-        return (
-            f'<a href="tg://user?id={user_id}">'
-            f'{safe_name}</a>'
-        )
+        return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
     return safe_name
 
@@ -234,7 +359,6 @@ def search_youtube(query):
     )
 
     response.raise_for_status()
-
     items = response.json().get("items", [])
 
     print(
@@ -273,15 +397,16 @@ def extract_audio_url(video_url):
         "cachedir": False
     }
 
-    deno_path = shutil.which("deno")
+    deno_path = DENO_PATH or shutil.which("deno")
 
     if deno_path:
-        print(f"✅ Deno Runtime Found: {deno_path}")
+        print(f"✅ yt-dlp Deno Runtime: {deno_path}")
+
+        options["js_runtimes"] = {
+            "deno": {"path": deno_path}
+        }
     else:
-        print(
-            "⚠️ Deno Runtime नहीं मिला। "
-            "कुछ YouTube formats उपलब्ध नहीं हो सकते।"
-        )
+        print("⚠️ Deno उपलब्ध नहीं है। yt-dlp बिना Deno चलेगा।")
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -363,7 +488,6 @@ async def play_next(chat_id):
                 raise FileNotFoundError(
                     f"Local MP3 नहीं मिली: {audio_input}"
                 )
-
         else:
             audio_input = await asyncio.to_thread(
                 extract_audio_url,
@@ -485,7 +609,6 @@ async def stop_music(chat_id):
         now_playing_messages.pop(chat_id, None)
 
         await calls.leave_call(chat_id)
-
         return True
 
     finally:
@@ -691,7 +814,6 @@ async def play_command(client, message):
                 )
                 return
 
-        # Request करने वाले व्यक्ति की जानकारी
         requester = message.from_user
 
         if requester:
@@ -846,9 +968,17 @@ async def queue_command(client, message):
 # ================= MAIN =================
 
 async def main():
-    global bot, user, calls
+    global bot, user, calls, DENO_PATH
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
+
+    # Bot start होने से पहले Deno install/check करें
+    DENO_PATH = await asyncio.to_thread(setup_deno)
+
+    if DENO_PATH:
+        print(f"✅ Deno Runtime Ready: {DENO_PATH}")
+    else:
+        print("⚠️ Deno उपलब्ध नहीं है; yt-dlp fallback mode में चलेगा।")
 
     bot = Client(
         "PandeyMusicBot",
