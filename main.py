@@ -1,3 +1,4 @@
+
 import os
 import re
 import asyncio
@@ -7,6 +8,7 @@ import requests
 import yt_dlp
 import unicodedata
 import shutil
+import html
 
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -14,7 +16,8 @@ from collections import defaultdict, deque
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import MediaStream, AudioQuality, StreamEnded
@@ -46,6 +49,7 @@ calls = None
 
 queues = defaultdict(deque)
 current_songs = {}
+now_playing_messages = {}
 
 playback_starting = set()
 skip_in_progress = set()
@@ -53,6 +57,64 @@ stop_in_progress = set()
 failed_chats = set()
 
 http = requests.Session()
+
+
+# ================= BUTTONS =================
+
+def music_buttons():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ Resume", callback_data="music:resume"),
+            InlineKeyboardButton("⏸️ Pause", callback_data="music:pause")
+        ],
+        [
+            InlineKeyboardButton("⏭️ Skip", callback_data="music:skip"),
+            InlineKeyboardButton("⏹️ Stop", callback_data="music:stop")
+        ],
+        [
+            InlineKeyboardButton("📋 Queue", callback_data="music:queue"),
+            InlineKeyboardButton("🎵 Play", callback_data="music:play")
+        ],
+        [
+            InlineKeyboardButton("🛑 End", callback_data="music:end")
+        ]
+    ])
+
+
+def requester_tag(song):
+    user_id = song.get("requester_id")
+    name = song.get("requester_name") or "Unknown User"
+
+    safe_name = html.escape(name)
+
+    if user_id:
+        return (
+            f'<a href="tg://user?id={user_id}">'
+            f'{safe_name}</a>'
+        )
+
+    return safe_name
+
+
+async def send_now_playing(chat_id, song):
+    title = html.escape(song.get("title", "Unknown Song"))
+    requested_by = requester_tag(song)
+
+    text = (
+        "🎵 <b>NOW PLAYING</b>\n\n"
+        f"🎧 <b>Song:</b> {title}\n"
+        f"👤 <b>Requested by:</b> {requested_by}\n\n"
+        "🎛 <b>Music Controls</b>"
+    )
+
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=music_buttons(),
+        parse_mode="html"
+    )
+
+    now_playing_messages[chat_id] = sent
 
 
 # ================= LOCAL SONGS =================
@@ -79,10 +141,12 @@ def normalize_song_name(name):
 
 def find_local_song(query):
     query = normalize_song_name(query)
+
     if not query:
         return None, []
 
     songs = get_local_songs()
+
     if not songs:
         return None, []
 
@@ -95,10 +159,12 @@ def find_local_song(query):
 
     for file in songs:
         filename_words = normalize_song_name(file.stem).split()
+
         if not filename_words:
             continue
 
         word_scores = []
+
         for query_word in query_words:
             best_score = 0.0
 
@@ -114,13 +180,16 @@ def find_local_song(query):
 
             word_scores.append(best_score)
 
-        matched_words = [score for score in word_scores if score >= 0.74]
+        matched_words = [
+            score for score in word_scores if score >= 0.74
+        ]
 
         if not matched_words:
             continue
 
         if len(query_words) > 1:
             required_matches = max(1, len(query_words) - 1)
+
             if len(matched_words) < required_matches:
                 continue
 
@@ -165,6 +234,7 @@ def search_youtube(query):
     )
 
     response.raise_for_status()
+
     items = response.json().get("items", [])
 
     print(
@@ -188,11 +258,6 @@ def search_youtube(query):
 # ================= AUDIO EXTRACTION =================
 
 def extract_audio_url(video_url):
-    """
-    YouTube से yt-dlp के जरिए उपलब्ध audio stream URL निकालता है।
-    यह function YouTube login, cookies या anti-bot verification को bypass
-    नहीं करता। Verification आने पर साफ error लौटाता है।
-    """
     started = time.perf_counter()
 
     options = {
@@ -208,14 +273,14 @@ def extract_audio_url(video_url):
         "cachedir": False
     }
 
-    # yt-dlp अपने आप PATH में उपलब्ध Deno/अन्य supported JS runtime खोजता है।
     deno_path = shutil.which("deno")
+
     if deno_path:
         print(f"✅ Deno Runtime Found: {deno_path}")
     else:
         print(
             "⚠️ Deno Runtime नहीं मिला। "
-            "YouTube extraction में कुछ formats अनुपलब्ध हो सकते हैं।"
+            "कुछ YouTube formats उपलब्ध नहीं हो सकते।"
         )
 
     try:
@@ -226,23 +291,17 @@ def extract_audio_url(video_url):
         error_text = str(error)
         lowered = error_text.casefold()
 
-        if (
-            "sign in to confirm you're not a bot" in lowered
-            or "confirm you're not a bot" in lowered
-        ):
+        if "sign in to confirm you're not a bot" in lowered:
             raise RuntimeError(
-                "YouTube ने इस वीडियो के लिए bot verification माँगा है। "
-                "यह Hosting/code की सामान्य playback error नहीं है। "
-                "इस वीडियो को अभी YouTube से play नहीं किया जा सका। "
-                "कृपया songs फ़ोल्डर में उपलब्ध Local MP3 चलाएँ।"
+                "YouTube ने इस वीडियो के लिए verification माँगा है।"
             ) from error
 
         raise RuntimeError(
-            f"yt-dlp audio extraction असफल: {error_text[:700]}"
+            f"yt-dlp extraction असफल: {error_text[:700]}"
         ) from error
 
     if not info:
-        raise RuntimeError("YouTube से audio information नहीं मिली।")
+        raise RuntimeError("YouTube audio information नहीं मिली।")
 
     audio_url = info.get("url")
 
@@ -263,6 +322,7 @@ def extract_audio_url(video_url):
                 ),
                 reverse=True
             )
+
             audio_url = audio_formats[0]["url"]
 
     if not audio_url:
@@ -280,14 +340,12 @@ def extract_audio_url(video_url):
 
 async def play_next(chat_id):
     if chat_id in playback_starting:
-        print(f"⏳ Playback पहले से शुरू हो रहा है: {chat_id}")
         return False
 
     if chat_id in stop_in_progress:
         return False
 
     if not queues[chat_id]:
-        print(f"📭 Queue Empty: {chat_id}")
         return False
 
     playback_starting.add(chat_id)
@@ -295,6 +353,7 @@ async def play_next(chat_id):
 
     try:
         started = time.perf_counter()
+
         print(f"🎧 Trying: {song['title']}")
 
         if song.get("source") == "local":
@@ -304,8 +363,6 @@ async def play_next(chat_id):
                 raise FileNotFoundError(
                     f"Local MP3 नहीं मिली: {audio_input}"
                 )
-
-            print(f"📁 Local MP3: {audio_input}")
 
         else:
             audio_input = await asyncio.to_thread(
@@ -328,14 +385,11 @@ async def play_next(chat_id):
         current_songs[chat_id] = song
         failed_chats.discard(chat_id)
 
+        await send_now_playing(chat_id, song)
+
         print(
             f"🎵 Total Playback Start Time: "
             f"{time.perf_counter() - started:.2f}s"
-        )
-
-        await bot.send_message(
-            chat_id,
-            f"🎵 अब बज रहा है:\n{song['title']}"
         )
 
         return True
@@ -349,20 +403,18 @@ async def play_next(chat_id):
         traceback.print_exc()
 
         try:
-            if "bot verification" in str(error).casefold():
-                user_message = (
-                    "❌ YouTube ने इस वीडियो पर verification माँगा है।\n\n"
-                    "यह गाना अभी नहीं चल पाया। "
-                    "आप songs फ़ोल्डर में उपलब्ध Local MP3 चला सकते हैं।"
+            if "verification" in str(error).casefold():
+                text = (
+                    "❌ YouTube ने इस वीडियो पर verification माँगा है।\n"
+                    "यह गाना अभी नहीं चल पाया।"
                 )
             else:
-                user_message = (
+                text = (
                     "❌ यह गाना शुरू नहीं हो पाया:\n"
-                    f"{song.get('title', 'Unknown')}\n\n"
-                    "अगला गाना अपने-आप नहीं चलाया जाएगा।"
+                    f"{song.get('title', 'Unknown')}"
                 )
 
-            await bot.send_message(chat_id, user_message)
+            await bot.send_message(chat_id, text)
 
         except Exception:
             traceback.print_exc()
@@ -371,6 +423,32 @@ async def play_next(chat_id):
 
     finally:
         playback_starting.discard(chat_id)
+
+
+# ================= QUEUE TEXT =================
+
+def make_queue_text(chat_id):
+    current = current_songs.get(chat_id)
+    queue = queues[chat_id]
+
+    text = "🎵 MUSIC QUEUE\n\n"
+
+    if current:
+        text += f"▶️ अभी बज रहा है:\n{current['title']}\n\n"
+
+    if queue:
+        text += "📋 आने वाले गाने:\n"
+
+        for number, song in enumerate(list(queue)[:15], start=1):
+            text += f"{number}. {song['title']}\n"
+
+        if len(queue) > 15:
+            text += f"\nऔर {len(queue) - 15} गाने बाकी हैं।"
+
+    if not current and not queue:
+        text = "📭 Queue खाली है।"
+
+    return text
 
 
 # ================= STREAM END =================
@@ -387,11 +465,143 @@ async def stream_ended_handler(_, update: StreamEnded):
         return
 
     current_songs.pop(chat_id, None)
+    now_playing_messages.pop(chat_id, None)
 
     if queues[chat_id]:
         await play_next(chat_id)
     else:
         await bot.send_message(chat_id, "🎵 Queue समाप्त हो गई।")
+
+
+# ================= STOP FUNCTION =================
+
+async def stop_music(chat_id):
+    stop_in_progress.add(chat_id)
+
+    try:
+        queues[chat_id].clear()
+        current_songs.pop(chat_id, None)
+        failed_chats.discard(chat_id)
+        now_playing_messages.pop(chat_id, None)
+
+        await calls.leave_call(chat_id)
+
+        return True
+
+    finally:
+        stop_in_progress.discard(chat_id)
+
+
+# ================= SKIP FUNCTION =================
+
+async def skip_music(chat_id):
+    if chat_id in skip_in_progress:
+        return False
+
+    if chat_id not in current_songs:
+        return False
+
+    skip_in_progress.add(chat_id)
+
+    try:
+        await calls.leave_call(chat_id)
+
+        current_songs.pop(chat_id, None)
+        now_playing_messages.pop(chat_id, None)
+
+        if queues[chat_id]:
+            return await play_next(chat_id)
+
+        return True
+
+    finally:
+        skip_in_progress.discard(chat_id)
+
+
+# ================= BUTTON CALLBACK =================
+
+async def music_callback(client, query):
+    if not query.message:
+        await query.answer("यह बटन उपलब्ध नहीं है।", show_alert=True)
+        return
+
+    chat_id = query.message.chat.id
+    action = query.data.split(":", 1)[1]
+
+    if action == "play":
+        await query.answer(
+            "गाना चलाने के लिए /play गाने का नाम भेजें।",
+            show_alert=True
+        )
+        return
+
+    if action == "pause":
+        try:
+            if chat_id not in current_songs:
+                await query.answer("अभी कोई गाना नहीं चल रहा।", show_alert=True)
+                return
+
+            await calls.pause_stream(chat_id)
+            await query.answer("⏸️ गाना Pause हो गया।")
+
+        except Exception as error:
+            print(f"BUTTON PAUSE ERROR: {error}")
+            await query.answer("Pause नहीं हो पाया।", show_alert=True)
+
+        return
+
+    if action == "resume":
+        try:
+            if chat_id not in current_songs:
+                await query.answer("अभी कोई गाना नहीं चल रहा।", show_alert=True)
+                return
+
+            await calls.resume_stream(chat_id)
+            await query.answer("▶️ गाना Resume हो गया।")
+
+        except Exception as error:
+            print(f"BUTTON RESUME ERROR: {error}")
+            await query.answer("Resume नहीं हो पाया।", show_alert=True)
+
+        return
+
+    if action == "skip":
+        try:
+            if chat_id not in current_songs:
+                await query.answer("अभी कोई गाना नहीं चल रहा।", show_alert=True)
+                return
+
+            await query.answer("⏭️ अगला गाना शुरू हो रहा है।")
+
+            success = await skip_music(chat_id)
+
+            if not success and not queues[chat_id]:
+                await bot.send_message(chat_id, "📭 Queue खाली है।")
+
+        except Exception as error:
+            print(f"BUTTON SKIP ERROR: {error}")
+            traceback.print_exc()
+
+        return
+
+    if action in ("stop", "end"):
+        try:
+            await stop_music(chat_id)
+            await query.answer("⏹️ Playback बंद कर दिया गया।")
+            await bot.send_message(chat_id, "⏹️ Music बंद और Queue साफ।")
+
+        except Exception as error:
+            print(f"BUTTON STOP ERROR: {error}")
+            await query.answer("Stop नहीं हो पाया।", show_alert=True)
+
+        return
+
+    if action == "queue":
+        await query.answer("📋 Queue भेज दी गई।")
+        await bot.send_message(chat_id, make_queue_text(chat_id))
+        return
+
+    await query.answer("Unknown button.", show_alert=True)
 
 
 # ================= START COMMAND =================
@@ -401,25 +611,25 @@ async def start_command(client, message):
         "🎵 Pandey Music Bot ऑनलाइन है!\n\n"
         "Commands:\n"
         "/play गाने का नाम\n"
-        "/pause - गाना रोकें\n"
-        "/resume - गाना फिर चलाएँ\n"
+        "/pause - Pause\n"
+        "/resume - Resume\n"
         "/skip - अगला गाना\n"
-        "/stop - Playback बंद करें\n"
-        "/end - Playback समाप्त करें\n"
+        "/stop - Playback बंद\n"
+        "/end - Playback समाप्त\n"
         "/queue - Queue देखें\n\n"
-        "📁 Local MP3 के लिए /play लिखें।"
+        "🎛 Music Controls के लिए Now Playing Buttons इस्तेमाल करें।"
     )
 
 
 # ================= PLAY COMMAND =================
 
 async def play_command(client, message):
+    chat_id = message.chat.id
+
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
-        f"Chat: {message.chat.id} | Message: {message.id}"
+        f"Chat: {chat_id} | Message: {message.id}"
     )
-
-    chat_id = message.chat.id
 
     if len(message.command) < 2:
         songs = get_local_songs()
@@ -427,16 +637,15 @@ async def play_command(client, message):
         if not songs:
             await message.reply_text(
                 "📂 songs फ़ोल्डर खाली है।\n"
-                "पहले उसमें MP3 फ़ाइल अपलोड करें।"
+                "गाना चलाने के लिए /play गाने का नाम भेजें।"
             )
             return
 
-        text = "📁 **Available Local Songs:**\n\n"
+        text = "📁 Available Local Songs:\n\n"
 
         for number, file in enumerate(songs[:20], start=1):
             text += f"{number}. {file.name}\n"
 
-        text += "\nगाना चलाने के लिए:\n/play गाने का नाम"
         await message.reply_text(text)
         return
 
@@ -448,6 +657,7 @@ async def play_command(client, message):
 
     try:
         started = time.perf_counter()
+
         local_file, multiple_matches = find_local_song(query)
 
         if multiple_matches:
@@ -456,7 +666,6 @@ async def play_command(client, message):
             for number, file in enumerate(multiple_matches, start=1):
                 text += f"{number}. {file.name}\n"
 
-            text += "\nकृपया गाने का नाम थोड़ा और स्पष्ट लिखें।"
             await status.edit_text(text)
             return
 
@@ -466,6 +675,7 @@ async def play_command(client, message):
                 "source": "local",
                 "path": str(local_file.resolve())
             }
+
             print(f"📁 Local Song Found: {local_file.name}")
 
         else:
@@ -480,6 +690,18 @@ async def play_command(client, message):
                     "❌ Local या YouTube पर गाना नहीं मिला।"
                 )
                 return
+
+        # Request करने वाले व्यक्ति की जानकारी
+        requester = message.from_user
+
+        if requester:
+            song["requester_id"] = requester.id
+            song["requester_name"] = (
+                requester.first_name or requester.username or "User"
+            )
+        else:
+            song["requester_id"] = None
+            song["requester_name"] = "Group Admin"
 
         print(
             f"🔎 Total Search Time: "
@@ -510,27 +732,19 @@ async def play_command(client, message):
             await status.delete()
         else:
             await status.edit_text(
-                "❌ गाना शुरू नहीं हो पाया। "
-                "Console में error देखें।"
+                "❌ गाना शुरू नहीं हो पाया। Console में Error देखें।"
             )
 
     except requests.HTTPError as error:
         print(f"❌ YOUTUBE API HTTP ERROR: {error}")
         traceback.print_exc()
 
-        try:
-            await status.edit_text(
-                "❌ YouTube Search API में समस्या है। "
-                "API key और quota जाँचें।"
-            )
-        except Exception:
-            traceback.print_exc()
+        await status.edit_text(
+            "❌ YouTube Search API में समस्या है। API key और quota जाँचें।"
+        )
 
     except Exception as error:
-        print(
-            f"❌ PLAY ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"❌ PLAY ERROR: {type(error).__name__}: {error}")
         traceback.print_exc()
 
         try:
@@ -552,14 +766,11 @@ async def pause_command(client, message):
             return
 
         await calls.pause_stream(chat_id)
-        await message.reply_text("⏸️ गाना रोक दिया गया है।")
+        await message.reply_text("⏸️ गाना Pause कर दिया गया है।")
 
     except Exception as error:
-        print(f"❌ PAUSE ERROR: {error}")
-        traceback.print_exc()
-        await message.reply_text(
-            f"❌ Pause Error: {type(error).__name__}"
-        )
+        print(f"PAUSE ERROR: {error}")
+        await message.reply_text("❌ Pause नहीं हो पाया।")
 
 
 # ================= RESUME COMMAND =================
@@ -573,14 +784,11 @@ async def resume_command(client, message):
             return
 
         await calls.resume_stream(chat_id)
-        await message.reply_text("▶️ गाना फिर शुरू हो गया है।")
+        await message.reply_text("▶️ गाना Resume हो गया है।")
 
     except Exception as error:
-        print(f"❌ RESUME ERROR: {error}")
-        traceback.print_exc()
-        await message.reply_text(
-            f"❌ Resume Error: {type(error).__name__}"
-        )
+        print(f"RESUME ERROR: {error}")
+        await message.reply_text("❌ Resume नहीं हो पाया।")
 
 
 # ================= SKIP COMMAND =================
@@ -588,66 +796,39 @@ async def resume_command(client, message):
 async def skip_command(client, message):
     chat_id = message.chat.id
 
-    if chat_id in skip_in_progress:
-        await message.reply_text("⏳ Skip पहले से चल रहा है।")
-        return
-
-    if chat_id not in current_songs:
-        await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
-        return
-
-    skip_in_progress.add(chat_id)
-
     try:
-        await calls.leave_call(chat_id)
-        current_songs.pop(chat_id, None)
+        if chat_id not in current_songs:
+            await message.reply_text("❌ अभी कोई गाना नहीं चल रहा है।")
+            return
 
-        await message.reply_text(
-            "⏭️ अगला गाना शुरू किया जा रहा है।"
-        )
+        success = await skip_music(chat_id)
 
-        if queues[chat_id]:
-            await play_next(chat_id)
+        if success:
+            await message.reply_text("⏭️ Skip हो गया।")
         else:
             await message.reply_text("📭 Queue खाली है।")
 
     except Exception as error:
-        print(f"❌ SKIP ERROR: {error}")
+        print(f"SKIP ERROR: {error}")
         traceback.print_exc()
-        await message.reply_text(
-            f"❌ Skip Error: {type(error).__name__}"
-        )
-
-    finally:
-        skip_in_progress.discard(chat_id)
+        await message.reply_text("❌ Skip नहीं हो पाया।")
 
 
 # ================= STOP COMMAND =================
 
 async def stop_command(client, message):
     chat_id = message.chat.id
-    stop_in_progress.add(chat_id)
 
     try:
-        queues[chat_id].clear()
-        current_songs.pop(chat_id, None)
-        failed_chats.discard(chat_id)
-
-        await calls.leave_call(chat_id)
-
+        await stop_music(chat_id)
         await message.reply_text(
             "⏹️ Playback बंद और Queue साफ कर दी गई है।"
         )
 
     except Exception as error:
-        print(f"❌ STOP ERROR: {error}")
+        print(f"STOP ERROR: {error}")
         traceback.print_exc()
-        await message.reply_text(
-            f"❌ Stop Error: {type(error).__name__}"
-        )
-
-    finally:
-        stop_in_progress.discard(chat_id)
+        await message.reply_text("❌ Stop नहीं हो पाया।")
 
 
 # ================= END COMMAND =================
@@ -659,32 +840,7 @@ async def end_command(client, message):
 # ================= QUEUE COMMAND =================
 
 async def queue_command(client, message):
-    chat_id = message.chat.id
-    queue = queues[chat_id]
-    current = current_songs.get(chat_id)
-
-    if not current and not queue:
-        await message.reply_text("📭 Queue खाली है।")
-        return
-
-    text = "🎵 **Music Queue**\n\n"
-
-    if current:
-        text += (
-            f"▶️ **अभी बज रहा है:**\n"
-            f"{current['title']}\n\n"
-        )
-
-    if queue:
-        text += "📋 **आने वाले गाने:**\n"
-
-        for number, song in enumerate(list(queue)[:10], start=1):
-            text += f"{number}. {song['title']}\n"
-
-        if len(queue) > 10:
-            text += f"\nऔर {len(queue) - 10} गाने बाकी हैं।"
-
-    await message.reply_text(text)
+    await message.reply_text(make_queue_text(message.chat.id))
 
 
 # ================= MAIN =================
@@ -735,8 +891,7 @@ async def main():
 
         if me.is_bot:
             raise RuntimeError(
-                "FreshLogin में Bot Account का session है। "
-                "Normal User Account का session आवश्यक है।"
+                "FreshLogin में Normal User Account का session आवश्यक है।"
             )
 
         await calls.start()
@@ -753,22 +908,28 @@ async def main():
                     filters.command(command_name)
                 )
             )
+
             print(f"✅ Handler Registered: /{command_name}")
 
+        bot.add_handler(
+            CallbackQueryHandler(
+                music_callback,
+                filters.regex(r"^music:")
+            )
+        )
+
+        print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot Online!")
         print("📁 Local MP3 Playback Enabled!")
         print("🔎 Smart Local Song Search Enabled!")
         print("🌐 YouTube Search Enabled!")
-        print("⏭️ Failed song पर auto-next बंद है।")
-        print("ℹ️ YouTube verification error आए तो Local MP3 इस्तेमाल करें।")
+        print("🎛 Inline Music Controls Enabled!")
+        print("👤 Clickable Requester Profile Tag Enabled!")
 
         await asyncio.Event().wait()
 
     except Exception as error:
-        print(
-            f"❌ MAIN ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"❌ MAIN ERROR: {type(error).__name__}: {error}")
         traceback.print_exc()
         raise
 
