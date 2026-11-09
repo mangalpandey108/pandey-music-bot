@@ -178,8 +178,10 @@ playback_starting = set()
 skip_in_progress = set()
 stop_in_progress = set()
 failed_chats = set()
-# /play requests currently searching YouTube, keyed by chat.
-pending_requests = defaultdict(int)
+
+# Queue में सबसे अगले गाने का audio URL पहले से तैयार रखने के लिए।
+prepared_audio = {}
+preload_tasks = {}
 
 http = requests.Session()
 
@@ -361,13 +363,100 @@ def extract_audio_url(video_url):
     return audio_url
 
 
+# ================= QUEUE AUDIO PRELOAD =================
+
+async def _preload_song(chat_id, song):
+    """Queue के सबसे अगले गाने का direct audio URL background में तैयार करें।"""
+    this_task = asyncio.current_task()
+    try:
+        print(f"⏳ PRELOAD START: {song.get('title', 'Unknown Song')}")
+        audio_url = await asyncio.to_thread(extract_audio_url, song["url"])
+        prepared_audio[chat_id] = (song, audio_url)
+        print(f"✅ PRELOAD READY: {song.get('title', 'Unknown Song')}")
+        return audio_url
+    except Exception as error:
+        print(
+            f"⚠️ PRELOAD FAILED: {song.get('title', 'Unknown Song')} | "
+            f"{type(error).__name__}: {error}"
+        )
+        traceback.print_exc()
+        return None
+    finally:
+        current = preload_tasks.get(chat_id)
+        if current and current[1] is this_task:
+            preload_tasks.pop(chat_id, None)
+
+
+async def start_preload(chat_id):
+    """एक समय में केवल एक queued song preload करें।"""
+    if not queues[chat_id]:
+        return
+
+    song = queues[chat_id][0]
+    cached = prepared_audio.get(chat_id)
+    if cached and cached[0] is song:
+        return
+
+    running = preload_tasks.get(chat_id)
+    if running and running[0] is song and not running[1].done():
+        return
+
+    task = asyncio.create_task(_preload_song(chat_id, song))
+    preload_tasks[chat_id] = (song, task)
+
+
+async def get_audio_for_song(chat_id, song):
+    """पहले से तैयार URL लें; न मिले तो अभी extraction करें।"""
+    cached = prepared_audio.get(chat_id)
+    if cached and cached[0] is song:
+        prepared_audio.pop(chat_id, None)
+        print(f"⚡ USING PRELOADED AUDIO: {song.get('title')}")
+        return cached[1]
+
+    running = preload_tasks.get(chat_id)
+    if running and running[0] is song:
+        try:
+            audio_url = await running[1]
+            cached = prepared_audio.get(chat_id)
+            if cached and cached[0] is song:
+                prepared_audio.pop(chat_id, None)
+                return cached[1]
+            if audio_url:
+                return audio_url
+        except Exception:
+            pass
+
+    print(f"🔄 PRELOAD उपलब्ध नहीं; audio तैयार कर रहा हूँ: {song.get('title')}")
+    return await asyncio.to_thread(extract_audio_url, song["url"])
+
+
+async def start_song_in_call(chat_id, song, audio_url):
+    """मौजूदा VC call को छोड़े बिना stream चलाएँ/बदलें।"""
+    await calls.play(
+        chat_id,
+        MediaStream(audio_url, AudioQuality.HIGH)
+    )
+
+    current_songs[chat_id] = song
+    failed_chats.discard(chat_id)
+
+    try:
+        await send_now_playing(chat_id, song)
+    except Exception as notify_error:
+        print(
+            "⚠️ Now Playing message भेजने में समस्या हुई: "
+            f"{type(notify_error).__name__}: {notify_error}"
+        )
+        traceback.print_exc()
+
+    # मौजूदा गाना शुरू होने के बाद केवल अगला गाना preload करें।
+    await start_preload(chat_id)
+
+
 # ================= PLAY NEXT =================
 
 async def play_next(chat_id):
-    if chat_id in playback_starting:
-        return False
-
-    if chat_id in stop_in_progress:
+    if chat_id in playback_starting or chat_id in stop_in_progress:
         return False
 
     if not queues[chat_id]:
@@ -378,51 +467,21 @@ async def play_next(chat_id):
 
     try:
         started = time.perf_counter()
-
         print(f"🎧 Trying: {song['title']}")
 
-        # YouTube URL extraction को event loop से अलग thread में चलाएँ।
-        audio_input = await asyncio.to_thread(
-            extract_audio_url,
-            song["url"]
-        )
-
+        audio_input = await get_audio_for_song(chat_id, song)
         vc_started = time.perf_counter()
 
-        await calls.play(
-            chat_id,
-            MediaStream(audio_input, AudioQuality.HIGH)
-        )
+        # पहली बार connect करेगा; active VC में stream replace करेगा।
+        await start_song_in_call(chat_id, song, audio_input)
 
-        print(
-            f"📡 VC Startup Time: "
-            f"{time.perf_counter() - vc_started:.2f}s"
-        )
-
-        current_songs[chat_id] = song
-        failed_chats.discard(chat_id)
-
-        try:
-            await send_now_playing(chat_id, song)
-        except Exception as notify_error:
-            # Notification fail होने पर चल रहे audio को failed न मानें।
-            print(
-                "⚠️ Now Playing message भेजने में समस्या हुई: "
-                f"{type(notify_error).__name__}: {notify_error}"
-            )
-            traceback.print_exc()
-
-        print(
-            f"🎵 Total Playback Start Time: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
-
+        print(f"📡 VC Startup/Stream Switch Time: {time.perf_counter() - vc_started:.2f}s")
+        print(f"🎵 Total Playback Start Time: {time.perf_counter() - started:.2f}s")
         return True
 
     except Exception as error:
         current_songs.pop(chat_id, None)
         failed_chats.add(chat_id)
-
         print(f"❌ Song Failed: {song.get('title')}")
         print(f"Error: {type(error).__name__}: {error}")
         traceback.print_exc()
@@ -438,17 +497,13 @@ async def play_next(chat_id):
                     "❌ यह गाना शुरू नहीं हो पाया:\n"
                     f"{song.get('title', 'Unknown')}"
                 )
-
             await bot.send_message(chat_id, text)
-
         except Exception:
             traceback.print_exc()
-
         return False
 
     finally:
         playback_starting.discard(chat_id)
-
 
 # ================= QUEUE TEXT =================
 
@@ -480,10 +535,15 @@ def make_queue_text(chat_id):
 
 async def stream_ended_handler(_, update: StreamEnded):
     chat_id = update.chat_id
-
     print(f"🏁 STREAM ENDED: {chat_id}")
 
     if chat_id in skip_in_progress or chat_id in stop_in_progress:
+        print(f"ℹ️ StreamEnded ignored during manual transition: {chat_id}")
+        return
+
+    # Old/stale StreamEnded event को नया गाना रोकने न दें।
+    if chat_id not in current_songs:
+        print(f"ℹ️ Stale StreamEnded ignored: {chat_id}")
         return
 
     if chat_id in failed_chats:
@@ -502,16 +562,19 @@ async def stream_ended_handler(_, update: StreamEnded):
 
 async def stop_music(chat_id):
     stop_in_progress.add(chat_id)
-
     try:
         queues[chat_id].clear()
         current_songs.pop(chat_id, None)
         failed_chats.discard(chat_id)
         now_playing_messages.pop(chat_id, None)
+        prepared_audio.pop(chat_id, None)
+
+        running = preload_tasks.pop(chat_id, None)
+        if running and not running[1].done():
+            running[1].cancel()
 
         await calls.leave_call(chat_id)
         return True
-
     finally:
         stop_in_progress.discard(chat_id)
 
@@ -519,24 +582,40 @@ async def stop_music(chat_id):
 # ================= SKIP FUNCTION =================
 
 async def skip_music(chat_id):
-    if chat_id in skip_in_progress:
+    if chat_id in skip_in_progress or chat_id in stop_in_progress:
         return False
 
     if chat_id not in current_songs:
         return False
 
     skip_in_progress.add(chat_id)
-
     try:
-        await calls.leave_call(chat_id)
+        # सबसे पहले अगला गाना queue से लें और उसका audio तैयार/प्राप्त करें।
+        if not queues[chat_id]:
+            current_songs.pop(chat_id, None)
+            now_playing_messages.pop(chat_id, None)
+            # Queue खाली होने पर भी Assistant VC में बना रहेगा।
+            try:
+                await calls.pause_stream(chat_id)
+            except Exception as pause_error:
+                print(f"⚠️ Empty queue pause warning: {pause_error}")
+            return True
 
-        current_songs.pop(chat_id, None)
-        now_playing_messages.pop(chat_id, None)
+        next_song = queues[chat_id].popleft()
+        print(f"⏭️ SKIP TO: {next_song.get('title')}")
 
-        if queues[chat_id]:
-            return await play_next(chat_id)
+        audio_url = await get_audio_for_song(chat_id, next_song)
 
+        # महत्वपूर्ण: यहाँ leave_call() नहीं है। calls.play active VC की
+        # stream को बदलता है, इसलिए Assistant call से बाहर नहीं जाता।
+        await start_song_in_call(chat_id, next_song, audio_url)
+        print(f"✅ SKIP COMPLETE; VC KEPT: {chat_id}")
         return True
+
+    except Exception as error:
+        print(f"❌ SKIP ERROR: {type(error).__name__}: {error}")
+        traceback.print_exc()
+        return False
 
     finally:
         skip_in_progress.discard(chat_id)
@@ -649,7 +728,6 @@ async def start_command(client, message):
 
 async def play_command(client, message):
     chat_id = message.chat.id
-    pending_requests[chat_id] += 1
 
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
@@ -660,7 +738,6 @@ async def play_command(client, message):
         await message.reply_text(
             "🎵 गाना चलाने के लिए लिखें:\n/play गाने का नाम"
         )
-        pending_requests[chat_id] = max(0, pending_requests[chat_id] - 1)
         return
 
     query = " ".join(message.command[1:]).strip()
@@ -694,6 +771,9 @@ async def play_command(client, message):
         )
 
         queues[chat_id].append(song)
+
+        if chat_id in current_songs and chat_id not in skip_in_progress:
+            await start_preload(chat_id)
 
         if (
             chat_id in current_songs
@@ -738,21 +818,6 @@ async def play_command(client, message):
             )
         except Exception:
             traceback.print_exc()
-
-    finally:
-        pending_requests[chat_id] = max(0, pending_requests[chat_id] - 1)
-
-        # If the previous stream ended while this request was searching,
-        # start the first queued song now. Do not start a duplicate stream.
-        if (
-            not current_songs.get(chat_id)
-            and chat_id not in playback_starting
-            and chat_id not in skip_in_progress
-            and chat_id not in stop_in_progress
-            and chat_id not in failed_chats
-            and queues[chat_id]
-        ):
-            await play_next(chat_id)
 
 
 # ================= PAUSE COMMAND =================
