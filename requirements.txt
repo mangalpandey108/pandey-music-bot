@@ -1,5 +1,6 @@
 pyrogram==2.0.106
 yt-dlp[default]==2026.10.26
+yt-dlp-ejs
 py-tgcalls[pyrogram]==3.0.0
 python-dotenv
 requests
