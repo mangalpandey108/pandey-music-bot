@@ -434,7 +434,7 @@ async def start_song_in_call(chat_id, song, audio_url):
     """मौजूदा VC call को छोड़े बिना stream चलाएँ/बदलें।"""
     await calls.play(
         chat_id,
-        MediaStream(audio_url, AudioQuality.HIGH)
+        MediaStream(audio_url, AudioQuality.MEDIUM)
     )
 
     current_songs[chat_id] = song
