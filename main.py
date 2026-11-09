@@ -376,7 +376,7 @@ async def start_song_in_call(chat_id, song, audio_url):
     """मौजूदा VC call को छोड़े बिना stream चलाएँ/बदलें।"""
     await calls.play(
         chat_id,
-        MediaStream(audio_url, AudioQuality.MEDIUM)
+        MediaStream(audio_url, AudioQuality.HIGH)
     )
 
     current_songs[chat_id] = song
@@ -528,11 +528,10 @@ async def skip_music(chat_id):
 
     skip_in_progress.add(chat_id)
     try:
-        # अगला गाना अब ही extract होगा; कोई background preload नहीं है।
+        # Queue खाली हो तो मौजूदा stream pause करें; call को बनाए रखें।
         if not queues[chat_id]:
             current_songs.pop(chat_id, None)
             now_playing_messages.pop(chat_id, None)
-            # Queue खाली होने पर भी Assistant VC में बना रहेगा।
             try:
                 await calls.pause_stream(chat_id)
             except Exception as pause_error:
@@ -541,21 +540,49 @@ async def skip_music(chat_id):
 
         next_song = queues[chat_id].popleft()
         print(f"⏭️ SKIP TO: {next_song.get('title')}")
+        skip_started = time.perf_counter()
+
+        # पुराना stream हटाने से अगले YouTube extraction के समय
+        # VC/FFmpeg pipeline की अतिरिक्त RAM इस्तेमाल नहीं होगी।
+        try:
+            await calls.leave_call(chat_id)
+            print(f"🧹 Previous VC stream released: {chat_id}")
+        except Exception as leave_error:
+            # Call पहले से disconnect हो तो भी extraction जारी रखें।
+            print(f"⚠️ Previous VC release warning: {leave_error}")
+
+        current_songs.pop(chat_id, None)
+        now_playing_messages.pop(chat_id, None)
 
         async with extraction_semaphore:
             audio_url = await asyncio.to_thread(
                 extract_audio_url, next_song["url"]
             )
 
-        # महत्वपूर्ण: यहाँ leave_call() नहीं है। calls.play active VC की
-        # stream को बदलता है, इसलिए Assistant call से बाहर नहीं जाता।
+        # calls.play नया group call/stream शुरू करेगा।
         await start_song_in_call(chat_id, next_song, audio_url)
-        print(f"✅ SKIP COMPLETE; VC KEPT: {chat_id}")
+
+        print(
+            f"✅ SKIP COMPLETE; VC RESTARTED: {chat_id} | "
+            f"Time: {time.perf_counter() - skip_started:.2f}s"
+        )
         return True
 
     except Exception as error:
         print(f"❌ SKIP ERROR: {type(error).__name__}: {error}")
         traceback.print_exc()
+
+        # Extraction असफल हो तो गाना queue में रहने दें ताकि खो न जाए।
+        try:
+            if 'next_song' in locals():
+                queues[chat_id].appendleft(next_song)
+            await bot.send_message(
+                chat_id,
+                "❌ अगला गाना शुरू नहीं हो पाया। Queue में रखा है; "
+                "कृपया कुछ देर बाद /play से दोबारा कोशिश करें।"
+            )
+        except Exception:
+            traceback.print_exc()
         return False
 
     finally:
