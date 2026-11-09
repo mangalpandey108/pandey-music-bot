@@ -179,6 +179,8 @@ playback_starting = set()
 skip_in_progress = set()
 stop_in_progress = set()
 failed_chats = set()
+# /play requests currently searching YouTube, keyed by chat.
+pending_requests = defaultdict(int)
 
 http = requests.Session()
 
@@ -648,6 +650,7 @@ async def start_command(client, message):
 
 async def play_command(client, message):
     chat_id = message.chat.id
+    pending_requests[chat_id] += 1
 
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
@@ -658,6 +661,7 @@ async def play_command(client, message):
         await message.reply_text(
             "🎵 गाना चलाने के लिए लिखें:\n/play गाने का नाम"
         )
+        pending_requests[chat_id] = max(0, pending_requests[chat_id] - 1)
         return
 
     query = " ".join(message.command[1:]).strip()
@@ -735,6 +739,21 @@ async def play_command(client, message):
             )
         except Exception:
             traceback.print_exc()
+
+    finally:
+        pending_requests[chat_id] = max(0, pending_requests[chat_id] - 1)
+
+        # If the previous stream ended while this request was searching,
+        # start the first queued song now. Do not start a duplicate stream.
+        if (
+            not current_songs.get(chat_id)
+            and chat_id not in playback_starting
+            and chat_id not in skip_in_progress
+            and chat_id not in stop_in_progress
+            and chat_id not in failed_chats
+            and queues[chat_id]
+        ):
+            await play_next(chat_id)
 
 
 # ================= PAUSE COMMAND =================
