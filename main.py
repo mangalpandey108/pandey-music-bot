@@ -31,6 +31,8 @@ API_ID_TEXT = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+AUTO_INSTALL_DENO = os.getenv("AUTO_INSTALL_DENO", "0").strip().lower() in ("1", "true", "yes")
+MAX_QUEUE_SIZE = max(1, int(os.getenv("MAX_QUEUE_SIZE", "20")))
 
 DENO_DIR = Path("/home/container/.deno-runtime").resolve()
 DENO_BIN = DENO_DIR / "deno"
@@ -54,6 +56,12 @@ def setup_deno():
     if existing:
         print(f"✅ System Deno Found: {existing}")
         return existing
+
+    # Resource-friendly default: do not download a runtime at startup.
+    # Set AUTO_INSTALL_DENO=1 in .env to enable the original installer.
+    if not AUTO_INSTALL_DENO:
+        print("ℹ️ Deno auto-install बंद है; जरूरत हो तो .env में AUTO_INSTALL_DENO=1 करें।")
+        return None
 
     if DENO_BIN.exists():
         try:
@@ -299,6 +307,7 @@ def extract_audio_url(video_url):
         "fragment_retries": 0,
         "file_access_retries": 0,
         "cachedir": False,
+        "concurrent_fragment_downloads": 1,
         "extractor_args": {
             "youtube": {
                 "skip": ["hls", "dash"]
@@ -738,6 +747,12 @@ async def play_command(client, message):
             f"{time.perf_counter() - started:.2f}s"
         )
 
+        if len(queues[chat_id]) >= MAX_QUEUE_SIZE:
+            await status.edit_text(
+                f"⚠️ Queue भर गई है (अधिकतम {MAX_QUEUE_SIZE} गाने)।"
+            )
+            return
+
         queues[chat_id].append(song)
 
         if (
@@ -892,13 +907,15 @@ async def main():
         "PandeyMusicBot",
         api_id=API_ID,
         api_hash=API_HASH,
-        bot_token=BOT_TOKEN
+        bot_token=BOT_TOKEN,
+        workers=4
     )
 
     user = Client(
         "FreshLogin",
         api_id=API_ID,
-        api_hash=API_HASH
+        api_hash=API_HASH,
+        workers=4
     )
 
     calls = PyTgCalls(user)
@@ -962,6 +979,8 @@ async def main():
         print("🎛 Inline Music Controls Enabled!")
         print("🚫 Queue Preload Disabled!")
         print("🧠 Single Audio Extraction Mode Enabled!")
+        print(f"📋 Maximum Queue Per Group: {MAX_QUEUE_SIZE}")
+        print("⚙️ Low Audio Quality / Reduced Worker Threads Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
 
         await asyncio.Event().wait()
