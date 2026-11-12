@@ -706,6 +706,13 @@ async def start_command(client, message):
 async def play_command(client, message):
     chat_id = message.chat.id
 
+    # /play command message को chat से हटाने की कोशिश करें।
+    # Telegram में इसके लिए bot को group में message delete permission चाहिए।
+    try:
+        await message.delete()
+    except Exception as delete_error:
+        print(f"⚠️ /play command delete नहीं हो पाया: {delete_error}")
+
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
         f"Chat: {chat_id} | Message: {message.id}"
