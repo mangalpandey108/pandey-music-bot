@@ -7,9 +7,6 @@ import yt_dlp
 import shutil
 import html
 import platform
-import zipfile
-import subprocess
-import stat
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -304,16 +301,9 @@ def extract_audio_url(video_url):
         "cachedir": False
     }
 
-    deno_path = DENO_PATH or shutil.which("deno")
-
-    if deno_path:
-        print(f"✅ yt-dlp Deno Runtime: {deno_path}")
-
-        options["js_runtimes"] = {
-            "deno": {"path": deno_path}
-        }
-    else:
-        print("⚠️ Deno उपलब्ध नहीं है। yt-dlp बिना Deno चलेगा।")
+    # 256 MB RAM वाले server पर Deno subprocess चलाने से process kill हो सकता है.
+    # इसलिए इस low-memory build में Deno/JS runtime जानबूझकर disable है.
+    print("⚠️ LOW-RAM MODE: Deno JavaScript runtime disabled.")
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -368,105 +358,20 @@ def extract_audio_url(video_url):
     return audio_url
 
 
-# ================= BACKGROUND AUDIO PRELOAD =================
+# ================= LOW-RAM AUDIO HANDLING =================
 
 async def _preload_next_song(chat_id):
-    """पूरे bot में केवल एक chat के अगले गाने का URL preload करें।"""
-    global preloaded_audio, preload_task, preload_chat_id
-    this_task = asyncio.current_task()
-    try:
-        if chat_id not in current_songs or not queues[chat_id] or chat_id in stop_in_progress:
-            return
-
-        song = queues[chat_id][0]
-        async with extraction_semaphore:
-            audio_url = await asyncio.to_thread(extract_audio_url, song["url"])
-
-        # Queue का head बदल गया हो या chat stop हो गई हो तो stale URL cache न करें।
-        if (
-            chat_id not in stop_in_progress
-            and queues[chat_id]
-            and queues[chat_id][0] is song
-            and chat_id in current_songs
-        ):
-            preloaded_audio = (chat_id, song, audio_url)
-            print(f"⚡ ONE-SONG PRELOAD READY: {song.get('title')} | Chat: {chat_id}")
-
-    except asyncio.CancelledError:
-        raise
-    except Exception as error:
-        print(
-            f"⚠️ Background preload failed | Chat: {chat_id} | "
-            f"{type(error).__name__}: {error}"
-        )
-    finally:
-        if preload_task is this_task:
-            preload_task = None
-            preload_chat_id = None
+    # 256 MB RAM पर background preload बंद रखा गया है.
+    return
 
 
 def schedule_preload(chat_id):
-    """पूरे bot में अधिकतम एक अगले गाने का preload चलाएँ/रखें।"""
-    global preloaded_audio, preload_task, preload_chat_id
-
-    if (
-        chat_id not in current_songs
-        or not queues[chat_id]
-        or chat_id in stop_in_progress
-    ):
-        return
-
-    next_song = queues[chat_id][0]
-    if (
-        preloaded_audio
-        and preloaded_audio[0] == chat_id
-        and preloaded_audio[1] is next_song
-    ):
-        return
-
-    # एक समय में पूरे bot के लिए केवल एक preload task.
-    if preload_task and not preload_task.done():
-        return
-
-    # केवल एक cached URL रखें; पुराना cache हटाएँ।
-    preloaded_audio = None
-    preload_chat_id = chat_id
-    preload_task = asyncio.create_task(_preload_next_song(chat_id))
+    # जानबूझकर कोई background extraction नहीं: RAM बचाने के लिए.
+    return
 
 
 async def get_audio_url_for_song(chat_id, song):
-    """पहले global preloaded URL लें; न मिले तो semaphore से extraction करें।"""
-    global preloaded_audio
-
-    if (
-        preloaded_audio
-        and preloaded_audio[0] == chat_id
-        and preloaded_audio[1] is song
-    ):
-        audio_url = preloaded_audio[2]
-        preloaded_audio = None
-        print(f"⚡ USING PRELOADED AUDIO: {song.get('title')}")
-        return audio_url
-
-    task = preload_task
-    if task and not task.done() and preload_chat_id == chat_id:
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception as error:
-            print(f"⚠️ Waiting for preload failed: {error}")
-
-    if (
-        preloaded_audio
-        and preloaded_audio[0] == chat_id
-        and preloaded_audio[1] is song
-    ):
-        audio_url = preloaded_audio[2]
-        preloaded_audio = None
-        print(f"⚡ USING PRELOADED AUDIO: {song.get('title')}")
-        return audio_url
-
+    # केवल जरूरत पड़ने पर एक ही audio extraction करें.
     async with extraction_semaphore:
         return await asyncio.to_thread(extract_audio_url, song["url"])
 
@@ -979,13 +884,9 @@ async def main():
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
 
-    # Bot start होने से पहले Deno install/check करें
-    DENO_PATH = await asyncio.to_thread(setup_deno)
-
-    if DENO_PATH:
-        print(f"✅ Deno Runtime Ready: {DENO_PATH}")
-    else:
-        print("⚠️ Deno उपलब्ध नहीं है; yt-dlp fallback mode में चलेगा।")
+    # 256 MB RAM: Deno auto-install/start नहीं करेंगे.
+    DENO_PATH = None
+    print("⚠️ LOW-RAM MODE: preload और Deno disabled; extraction on demand.")
 
     bot = Client(
         "PandeyMusicBot",
