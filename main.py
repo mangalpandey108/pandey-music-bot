@@ -31,8 +31,6 @@ API_ID_TEXT = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-AUTO_INSTALL_DENO = os.getenv("AUTO_INSTALL_DENO", "0").strip().lower() in ("1", "true", "yes")
-MAX_QUEUE_SIZE = max(1, int(os.getenv("MAX_QUEUE_SIZE", "20")))
 
 DENO_DIR = Path("/home/container/.deno-runtime").resolve()
 DENO_BIN = DENO_DIR / "deno"
@@ -56,12 +54,6 @@ def setup_deno():
     if existing:
         print(f"✅ System Deno Found: {existing}")
         return existing
-
-    # Resource-friendly default: do not download a runtime at startup.
-    # Set AUTO_INSTALL_DENO=1 in .env to enable the original installer.
-    if not AUTO_INSTALL_DENO:
-        print("ℹ️ Deno auto-install बंद है; जरूरत हो तो .env में AUTO_INSTALL_DENO=1 करें।")
-        return None
 
     if DENO_BIN.exists():
         try:
@@ -295,24 +287,16 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
 
     options = {
-        # Direct HTTPS audio चुनें और अनावश्यक manifest extraction छोड़ें।
-        "format": "bestaudio[protocol=https]/bestaudio",
+        "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": False,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 8,
+        "socket_timeout": 12,
         "retries": 0,
         "extractor_retries": 0,
         "fragment_retries": 0,
-        "file_access_retries": 0,
-        "cachedir": False,
-        "concurrent_fragment_downloads": 1,
-        "extractor_args": {
-            "youtube": {
-                "skip": ["hls", "dash"]
-            }
-        }
+        "cachedir": False
     }
 
     deno_path = DENO_PATH or shutil.which("deno")
@@ -385,7 +369,7 @@ async def start_song_in_call(chat_id, song, audio_url):
     """मौजूदा VC call को छोड़े बिना stream चलाएँ/बदलें।"""
     await calls.play(
         chat_id,
-        MediaStream(audio_url, AudioQuality.HIGH)
+        MediaStream(audio_url, AudioQuality.MEDIUM)
     )
 
     current_songs[chat_id] = song
@@ -537,10 +521,11 @@ async def skip_music(chat_id):
 
     skip_in_progress.add(chat_id)
     try:
-        # Queue खाली हो तो मौजूदा stream pause करें; call को बनाए रखें।
+        # अगला गाना अब ही extract होगा; कोई background preload नहीं है।
         if not queues[chat_id]:
             current_songs.pop(chat_id, None)
             now_playing_messages.pop(chat_id, None)
+            # Queue खाली होने पर भी Assistant VC में बना रहेगा।
             try:
                 await calls.pause_stream(chat_id)
             except Exception as pause_error:
@@ -549,49 +534,21 @@ async def skip_music(chat_id):
 
         next_song = queues[chat_id].popleft()
         print(f"⏭️ SKIP TO: {next_song.get('title')}")
-        skip_started = time.perf_counter()
-
-        # पुराना stream हटाने से अगले YouTube extraction के समय
-        # VC/FFmpeg pipeline की अतिरिक्त RAM इस्तेमाल नहीं होगी।
-        try:
-            await calls.leave_call(chat_id)
-            print(f"🧹 Previous VC stream released: {chat_id}")
-        except Exception as leave_error:
-            # Call पहले से disconnect हो तो भी extraction जारी रखें।
-            print(f"⚠️ Previous VC release warning: {leave_error}")
-
-        current_songs.pop(chat_id, None)
-        now_playing_messages.pop(chat_id, None)
 
         async with extraction_semaphore:
             audio_url = await asyncio.to_thread(
                 extract_audio_url, next_song["url"]
             )
 
-        # calls.play नया group call/stream शुरू करेगा।
+        # महत्वपूर्ण: यहाँ leave_call() नहीं है। calls.play active VC की
+        # stream को बदलता है, इसलिए Assistant call से बाहर नहीं जाता।
         await start_song_in_call(chat_id, next_song, audio_url)
-
-        print(
-            f"✅ SKIP COMPLETE; VC RESTARTED: {chat_id} | "
-            f"Time: {time.perf_counter() - skip_started:.2f}s"
-        )
+        print(f"✅ SKIP COMPLETE; VC KEPT: {chat_id}")
         return True
 
     except Exception as error:
         print(f"❌ SKIP ERROR: {type(error).__name__}: {error}")
         traceback.print_exc()
-
-        # Extraction असफल हो तो गाना queue में रहने दें ताकि खो न जाए।
-        try:
-            if 'next_song' in locals():
-                queues[chat_id].appendleft(next_song)
-            await bot.send_message(
-                chat_id,
-                "❌ अगला गाना शुरू नहीं हो पाया। Queue में रखा है; "
-                "कृपया कुछ देर बाद /play से दोबारा कोशिश करें।"
-            )
-        except Exception:
-            traceback.print_exc()
         return False
 
     finally:
@@ -706,13 +663,6 @@ async def start_command(client, message):
 async def play_command(client, message):
     chat_id = message.chat.id
 
-    # /play command message को chat से हटाने की कोशिश करें।
-    # Telegram में इसके लिए bot को group में message delete permission चाहिए।
-    try:
-        await message.delete()
-    except Exception as delete_error:
-        print(f"⚠️ /play command delete नहीं हो पाया: {delete_error}")
-
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
         f"Chat: {chat_id} | Message: {message.id}"
@@ -753,12 +703,6 @@ async def play_command(client, message):
             f"🔎 Total Search Time: "
             f"{time.perf_counter() - started:.2f}s"
         )
-
-        if len(queues[chat_id]) >= MAX_QUEUE_SIZE:
-            await status.edit_text(
-                f"⚠️ Queue भर गई है (अधिकतम {MAX_QUEUE_SIZE} गाने)।"
-            )
-            return
 
         queues[chat_id].append(song)
 
@@ -895,6 +839,26 @@ async def queue_command(client, message):
     await message.reply_text(make_queue_text(message.chat.id))
 
 
+# ================= COMMAND AUTO DELETE =================
+
+async def command_handler_with_auto_delete(callback):
+    """हर registered command का user message पहले delete करने की कोशिश करें।"""
+    async def wrapped(client, message):
+        try:
+            await message.delete()
+            print(f"🗑️ Command auto-deleted: {message.text or message.caption}")
+        except Exception as delete_error:
+            # Bot के पास Delete Messages permission न हो तो command फिर भी चले।
+            print(
+                "⚠️ Command delete नहीं हो पाया (bot permission जाँचें): "
+                f"{type(delete_error).__name__}: {delete_error}"
+            )
+
+        return await callback(client, message)
+
+    return wrapped
+
+
 # ================= MAIN =================
 
 async def main():
@@ -914,15 +878,13 @@ async def main():
         "PandeyMusicBot",
         api_id=API_ID,
         api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        workers=4
+        bot_token=BOT_TOKEN
     )
 
     user = Client(
         "FreshLogin",
         api_id=API_ID,
-        api_hash=API_HASH,
-        workers=4
+        api_hash=API_HASH
     )
 
     calls = PyTgCalls(user)
@@ -966,7 +928,7 @@ async def main():
         for command_name, callback in handlers:
             bot.add_handler(
                 MessageHandler(
-                    callback,
+                    command_handler_with_auto_delete(callback),
                     filters.command(command_name)
                 )
             )
@@ -986,8 +948,6 @@ async def main():
         print("🎛 Inline Music Controls Enabled!")
         print("🚫 Queue Preload Disabled!")
         print("🧠 Single Audio Extraction Mode Enabled!")
-        print(f"📋 Maximum Queue Per Group: {MAX_QUEUE_SIZE}")
-        print("⚙️ Low Audio Quality / Reduced Worker Threads Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
 
         await asyncio.Event().wait()
@@ -1016,4 +976,25 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    RESTART_DELAY_SECONDS = 10
+
+    while True:
+        try:
+            print("🔄 Bot process शुरू हो रहा है...")
+            asyncio.run(main())
+            print("⚠️ Main loop सामान्य रूप से बंद हुआ; 10 सेकंड में restart होगा।")
+
+        except KeyboardInterrupt:
+            print("🛑 Manual shutdown मिला; restart नहीं किया जाएगा।")
+            break
+
+        except Exception as error:
+            print(
+                f"💥 Bot crash/error: {type(error).__name__}: {error}"
+            )
+            traceback.print_exc()
+            print(
+                f"🔁 {RESTART_DELAY_SECONDS} सेकंड बाद automatic restart..."
+            )
+
+        time.sleep(RESTART_DELAY_SECONDS)
