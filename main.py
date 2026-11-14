@@ -179,7 +179,11 @@ skip_in_progress = set()
 stop_in_progress = set()
 failed_chats = set()
 
-# 512 MB hosting पर एक समय में केवल एक audio extraction।
+# अगली queue entry का audio URL background में तैयार रखें।
+preloaded_audio = {}
+preload_tasks = {}
+
+# 512 MB hosting पर एक समय में केवल एक audio extraction.
 # इससे अलग-अलग groups की simultaneous extraction से RAM pressure घटता है।
 extraction_semaphore = asyncio.Semaphore(1)
 
@@ -363,6 +367,97 @@ def extract_audio_url(video_url):
     return audio_url
 
 
+# ================= BACKGROUND AUDIO PRELOAD =================
+
+async def _preload_next_song(chat_id):
+    """Queue के अगले गाने का audio URL background में तैयार करें।"""
+    try:
+        if chat_id not in current_songs or not queues[chat_id] or chat_id in stop_in_progress:
+            return
+
+        song = queues[chat_id][0]
+        async with extraction_semaphore:
+            audio_url = await asyncio.to_thread(
+                extract_audio_url, song["url"]
+            )
+
+        # एक समय पर केवल एक URL cache में रखें।
+        # Skip ने song queue से निकाल लिया हो तो भी skip handler इसी task का
+        # इंतज़ार कर रहा होगा और इस तैयार URL को consume कर सकेगा।
+        if chat_id not in stop_in_progress:
+            preloaded_audio[chat_id] = (song, audio_url)
+            print(f"⚡ ONE-SONG PRELOAD READY: {song.get('title')} | Chat: {chat_id}")
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(
+            f"⚠️ Background preload failed | Chat: {chat_id} | "
+            f"{type(error).__name__}: {error}"
+        )
+    finally:
+        if preload_tasks.get(chat_id) is asyncio.current_task():
+            preload_tasks.pop(chat_id, None)
+
+
+def schedule_preload(chat_id):
+    """
+    केवल queue के बिल्कुल अगले एक गाने का URL preload करें।
+    Cached URL या उसी गाने का चल रहा preload हो तो दूसरा task न बनाएँ।
+    """
+    if (
+        chat_id not in current_songs
+        or not queues[chat_id]
+        or chat_id in stop_in_progress
+    ):
+        return
+
+    next_song = queues[chat_id][0]
+
+    # उसी अगले गाने का URL पहले से तैयार है: दोबारा extraction नहीं।
+    cached = preloaded_audio.get(chat_id)
+    if cached and cached[0] is next_song:
+        return
+
+    # एक chat में एक समय पर केवल एक preload task।
+    task = preload_tasks.get(chat_id)
+    if task and not task.done():
+        return
+
+    # पुराने/अप्रासंगिक cache को हटाकर सिर्फ queue-head रखें।
+    if cached and cached[0] is not next_song:
+        preloaded_audio.pop(chat_id, None)
+
+    preload_tasks[chat_id] = asyncio.create_task(_preload_next_song(chat_id))
+
+
+async def get_audio_url_for_song(chat_id, song):
+    """पहले preloaded URL लें; न मिले तो सामान्य extraction करें।"""
+    cached = preloaded_audio.get(chat_id)
+    if cached and cached[0] is song:
+        preloaded_audio.pop(chat_id, None)
+        print(f"⚡ USING PRELOADED AUDIO: {song.get('title')}")
+        return cached[1]
+
+    task = preload_tasks.get(chat_id)
+    if task and not task.done():
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            print(f"⚠️ Waiting for preload failed: {error}")
+
+    cached = preloaded_audio.get(chat_id)
+    if cached and cached[0] is song:
+        preloaded_audio.pop(chat_id, None)
+        print(f"⚡ USING PRELOADED AUDIO: {song.get('title')}")
+        return cached[1]
+
+    async with extraction_semaphore:
+        return await asyncio.to_thread(extract_audio_url, song["url"])
+
+
 # ================= PLAYBACK =================
 
 async def start_song_in_call(chat_id, song, audio_url):
@@ -402,15 +497,13 @@ async def play_next(chat_id):
         started = time.perf_counter()
         print(f"🎧 Trying: {song['title']}")
 
-        # Preload बंद है: audio तभी extract होगा जब गाना चलने की बारी आएगी।
-        async with extraction_semaphore:
-            audio_input = await asyncio.to_thread(
-                extract_audio_url, song["url"]
-            )
+        # अगर यह गाना पहले से background में तैयार है तो URL तुरंत मिलेगा।
+        audio_input = await get_audio_url_for_song(chat_id, song)
         vc_started = time.perf_counter()
 
-        # पहली बार connect करेगा; active VC में stream replace करेगा।
+        # Active VC में stream replace होगा; call leave नहीं की जाती।
         await start_song_in_call(chat_id, song, audio_input)
+        schedule_preload(chat_id)
 
         print(f"📡 VC Startup/Stream Switch Time: {time.perf_counter() - vc_started:.2f}s")
         print(f"🎵 Total Playback Start Time: {time.perf_counter() - started:.2f}s")
@@ -504,6 +597,12 @@ async def stop_music(chat_id):
         current_songs.pop(chat_id, None)
         failed_chats.discard(chat_id)
         now_playing_messages.pop(chat_id, None)
+        preloaded_audio.pop(chat_id, None)
+
+        preload_task = preload_tasks.pop(chat_id, None)
+        if preload_task and not preload_task.done():
+            preload_task.cancel()
+
         await calls.leave_call(chat_id)
         return True
     finally:
@@ -535,14 +634,13 @@ async def skip_music(chat_id):
         next_song = queues[chat_id].popleft()
         print(f"⏭️ SKIP TO: {next_song.get('title')}")
 
-        async with extraction_semaphore:
-            audio_url = await asyncio.to_thread(
-                extract_audio_url, next_song["url"]
-            )
+        # पहले से तैयार URL इस्तेमाल करें; जरूरत पड़ने पर ही extraction करें।
+        audio_url = await get_audio_url_for_song(chat_id, next_song)
 
         # महत्वपूर्ण: यहाँ leave_call() नहीं है। calls.play active VC की
         # stream को बदलता है, इसलिए Assistant call से बाहर नहीं जाता।
         await start_song_in_call(chat_id, next_song, audio_url)
+        schedule_preload(chat_id)
         print(f"✅ SKIP COMPLETE; VC KEPT: {chat_id}")
         return True
 
@@ -705,6 +803,7 @@ async def play_command(client, message):
         )
 
         queues[chat_id].append(song)
+        schedule_preload(chat_id)
 
         if (
             chat_id in current_songs
