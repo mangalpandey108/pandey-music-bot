@@ -841,7 +841,7 @@ async def queue_command(client, message):
 
 # ================= COMMAND AUTO DELETE =================
 
-async def command_handler_with_auto_delete(callback):
+def command_handler_with_auto_delete(callback):
     """हर registered command का user message पहले delete करने की कोशिश करें।"""
     async def wrapped(client, message):
         try:
