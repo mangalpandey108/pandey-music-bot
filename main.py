@@ -9,7 +9,6 @@ import html
 import platform
 import subprocess
 import hashlib
-import gc
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -180,6 +179,26 @@ def setup_quickjs():
 
 # ================= GLOBALS =================
 
+def log_disk_usage():
+    """Disk की स्थिति बताएँ; user की files अपने-आप delete नहीं करता।"""
+    try:
+        usage = shutil.disk_usage("/home/container")
+        used_mb = usage.used / (1024 * 1024)
+        total_mb = usage.total / (1024 * 1024)
+        percent = (usage.used / usage.total) * 100 if usage.total else 0
+        print(
+            f"💾 Disk Usage: {used_mb:.1f}/{total_mb:.1f} MiB "
+            f"({percent:.1f}%)"
+        )
+        if percent >= 90:
+            print(
+                "⚠️ Disk 90% से अधिक भरा है। Files जाँचकर manually "
+                "अनावश्यक files हटाएँ; cookies/session files न हटाएँ।"
+            )
+    except Exception as error:
+        print(f"⚠️ Disk usage जाँच नहीं हो सकी: {error}")
+
+
 bot = None
 user = None
 calls = None
@@ -256,6 +275,15 @@ async def send_now_playing(chat_id, song):
         reply_markup=music_buttons(),
         parse_mode=enums.ParseMode.HTML
     )
+
+    # अगर इस बीच अगला गाना शुरू हो चुका है, तो पुराना notification हटाएँ।
+    if current_songs.get(chat_id) is not song:
+        try:
+            await sent.delete()
+        except Exception:
+            pass
+        return
+
     now_playing_messages[chat_id] = sent
 
 
@@ -387,7 +415,6 @@ def extract_audio_url(video_url):
             info.clear()
         del info
         info = None
-        gc.collect()
 
         print(f"⚡ Audio Extraction Time: {time.perf_counter() - started:.2f}s")
         return audio_url
@@ -405,7 +432,6 @@ def extract_audio_url(video_url):
         if isinstance(info, dict):
             info.clear()
         info = None
-        gc.collect()
 
 
 # ================= SMART PRELOAD (ONE GLOBAL SLOT) =================
@@ -493,14 +519,18 @@ async def start_song_in_call(chat_id, song, audio_url):
     current_songs[chat_id] = song
     failed_chats.discard(chat_id)
 
-    try:
-        await send_now_playing(chat_id, song)
-    except Exception as notify_error:
-        print(
-            "⚠️ Now Playing message भेजने में समस्या हुई: "
-            f"{type(notify_error).__name__}: {notify_error}"
-        )
-        traceback.print_exc()
+    async def notify():
+        try:
+            await send_now_playing(chat_id, song)
+        except Exception as notify_error:
+            print(
+                "⚠️ Now Playing message भेजने में समस्या हुई: "
+                f"{type(notify_error).__name__}: {notify_error}"
+            )
+            traceback.print_exc()
+
+    # VC stream पहले शुरू हो; Telegram notification background में भेजें।
+    asyncio.create_task(notify())
 
 
 # ================= PLAY NEXT =================
@@ -938,6 +968,7 @@ async def main():
     global bot, user, calls, DENO_PATH, QJS_PATH
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
+    log_disk_usage()
 
     DENO_PATH = None
     QJS_PATH = setup_quickjs()
@@ -1012,6 +1043,7 @@ async def main():
         print("🌐 YouTube Search Enabled!")
         print("🎛 Inline Music Controls Enabled!")
         print("⚡ One-Song Global Smart Preload Enabled!")
+        print("🚀 Non-blocking Now Playing Notification Enabled!")
         print("🧠 Single Audio Extraction Mode Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
 
