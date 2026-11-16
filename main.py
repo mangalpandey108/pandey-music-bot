@@ -31,7 +31,8 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_COOKIES_FILE = os.getenv(
     "YOUTUBE_COOKIES_FILE", "/home/container/cookies.txt"
 ).strip()
-# auto = use Node.js only if already installed; Deno is opt-in.
+# auto = prefer lightweight QuickJS (qjs), then Node.js; Deno stays disabled.
+# Set YOUTUBE_JS_RUNTIME=quickjs, node, or an explicit executable path if needed.
 YOUTUBE_JS_RUNTIME = os.getenv("YOUTUBE_JS_RUNTIME", "auto").strip().lower()
 
 DENO_DIR = Path("/home/container/.deno-runtime").resolve()
@@ -313,23 +314,33 @@ def extract_audio_url(video_url):
 
     runtime_path = None
     runtime_name = None
+
     if YOUTUBE_JS_RUNTIME == "auto":
+        # 256 MB RAM पर qjs को प्राथमिकता दें; Deno जानबूझकर इस्तेमाल नहीं होगा।
+        runtime_path = shutil.which("qjs")
+        runtime_name = "quickjs" if runtime_path else None
+        if not runtime_path:
+            runtime_path = shutil.which("node")
+            runtime_name = "node" if runtime_path else None
+    elif YOUTUBE_JS_RUNTIME in ("quickjs", "qjs"):
+        runtime_path = shutil.which("qjs")
+        runtime_name = "quickjs" if runtime_path else None
+    elif YOUTUBE_JS_RUNTIME == "node":
         runtime_path = shutil.which("node")
         runtime_name = "node" if runtime_path else None
-    elif YOUTUBE_JS_RUNTIME in ("node", "deno"):
-        runtime_path = shutil.which(YOUTUBE_JS_RUNTIME)
-        runtime_name = YOUTUBE_JS_RUNTIME if runtime_path else None
     elif YOUTUBE_JS_RUNTIME:
         candidate = Path(YOUTUBE_JS_RUNTIME)
         if candidate.is_file():
             runtime_path = str(candidate)
-            runtime_name = "custom"
+            # Custom path is treated as QuickJS only when its filename is qjs;
+            # otherwise retain the previous custom-runtime behavior.
+            runtime_name = "quickjs" if candidate.name == "qjs" else "custom"
 
     if runtime_path and runtime_name:
         options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
-        print(f"✅ yt-dlp JS runtime: {runtime_path}")
+        print(f"✅ yt-dlp JS runtime ({runtime_name}): {runtime_path}")
     else:
-        print("⚠️ JS runtime नहीं मिला; कुछ YouTube videos extract नहीं होंगे।")
+        print("⚠️ JS runtime नहीं मिला (qjs/Node.js); कुछ YouTube videos extract नहीं होंगे।")
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
