@@ -28,6 +28,11 @@ API_ID_TEXT = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_COOKIES_FILE = os.getenv(
+    "YOUTUBE_COOKIES_FILE", "/home/container/cookies.txt"
+).strip()
+# auto = use Node.js only if already installed; Deno is opt-in.
+YOUTUBE_JS_RUNTIME = os.getenv("YOUTUBE_JS_RUNTIME", "auto").strip().lower()
 
 DENO_DIR = Path("/home/container/.deno-runtime").resolve()
 DENO_BIN = DENO_DIR / "deno"
@@ -287,7 +292,6 @@ def search_youtube(query):
 
 def extract_audio_url(video_url):
     started = time.perf_counter()
-
     options = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -298,26 +302,44 @@ def extract_audio_url(video_url):
         "retries": 0,
         "extractor_retries": 0,
         "fragment_retries": 0,
-        "cachedir": False
+        "cachedir": False,
     }
 
-    # 256 MB RAM वाले server पर Deno subprocess चलाने से process kill हो सकता है.
-    # इसलिए इस low-memory build में Deno/JS runtime जानबूझकर disable है.
-    print("⚠️ LOW-RAM MODE: Deno JavaScript runtime disabled.")
+    if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
+        options["cookiefile"] = YOUTUBE_COOKIES_FILE
+        print("🍪 YouTube cookies file enabled.")
+    else:
+        print("⚠️ cookies.txt नहीं मिली; YouTube verification आ सकता है।")
+
+    runtime_path = None
+    runtime_name = None
+    if YOUTUBE_JS_RUNTIME == "auto":
+        runtime_path = shutil.which("node")
+        runtime_name = "node" if runtime_path else None
+    elif YOUTUBE_JS_RUNTIME in ("node", "deno"):
+        runtime_path = shutil.which(YOUTUBE_JS_RUNTIME)
+        runtime_name = YOUTUBE_JS_RUNTIME if runtime_path else None
+    elif YOUTUBE_JS_RUNTIME:
+        candidate = Path(YOUTUBE_JS_RUNTIME)
+        if candidate.is_file():
+            runtime_path = str(candidate)
+            runtime_name = "custom"
+
+    if runtime_path and runtime_name:
+        options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
+        print(f"✅ yt-dlp JS runtime: {runtime_path}")
+    else:
+        print("⚠️ JS runtime नहीं मिला; कुछ YouTube videos extract नहीं होंगे।")
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(video_url, download=False)
-
     except yt_dlp.utils.DownloadError as error:
         error_text = str(error)
-        lowered = error_text.casefold()
-
-        if "sign in to confirm you're not a bot" in lowered:
+        if "sign in to confirm you're not a bot" in error_text.casefold():
             raise RuntimeError(
-                "YouTube ने इस वीडियो के लिए verification माँगा है।"
+                "YouTube verification माँग रहा है; server पर valid cookies.txt लगाएँ।"
             ) from error
-
         raise RuntimeError(
             f"yt-dlp extraction असफल: {error_text[:700]}"
         ) from error
@@ -326,52 +348,95 @@ def extract_audio_url(video_url):
         raise RuntimeError("YouTube audio information नहीं मिली।")
 
     audio_url = info.get("url")
-
     if not audio_url:
-        formats = info.get("formats") or []
-
         audio_formats = [
-            item for item in formats
-            if item.get("url")
-            and item.get("acodec") not in (None, "none")
+            item for item in (info.get("formats") or [])
+            if item.get("url") and item.get("acodec") not in (None, "none")
         ]
-
         if audio_formats:
             audio_formats.sort(
-                key=lambda item: (
-                    item.get("abr") or 0,
-                    item.get("tbr") or 0
-                ),
-                reverse=True
+                key=lambda item: (item.get("abr") or 0, item.get("tbr") or 0),
+                reverse=True,
             )
-
             audio_url = audio_formats[0]["url"]
 
     if not audio_url:
         raise RuntimeError("Direct Audio URL उपलब्ध नहीं है।")
 
-    print(
-        f"⚡ Audio Extraction Time: "
-        f"{time.perf_counter() - started:.2f}s"
-    )
-
+    print(f"⚡ Audio Extraction Time: {time.perf_counter() - started:.2f}s")
     return audio_url
 
 
-# ================= LOW-RAM AUDIO HANDLING =================
+# ================= SMART PRELOAD (ONE GLOBAL SLOT) =================
 
-async def _preload_next_song(chat_id):
-    # 256 MB RAM पर background preload बंद रखा गया है.
-    return
+async def _preload_next_song(chat_id, song):
+    global preloaded_audio, preload_task, preload_chat_id
+    this_task = asyncio.current_task()
+    try:
+        async with extraction_semaphore:
+            audio_url = await asyncio.to_thread(extract_audio_url, song["url"])
+
+        if (
+            chat_id not in stop_in_progress
+            and queues[chat_id]
+            and queues[chat_id][0] is song
+            and preloaded_audio is None
+        ):
+            preloaded_audio = (chat_id, song, audio_url)
+            print(f"⚡ SMART PRELOAD READY: {song.get('title')}")
+        else:
+            print("ℹ️ पुराना preload result discard किया।")
+    except Exception as error:
+        print(
+            f"⚠️ SMART PRELOAD FAILED: {type(error).__name__}: {error}"
+        )
+    finally:
+        if preload_task is this_task:
+            preload_task = None
+            preload_chat_id = None
 
 
 def schedule_preload(chat_id):
-    # जानबूझकर कोई background extraction नहीं: RAM बचाने के लिए.
-    return
+    global preload_task, preload_chat_id
+    if chat_id in stop_in_progress or chat_id not in current_songs:
+        return
+    if not queues[chat_id] or preloaded_audio is not None:
+        return
+    if preload_task is not None and not preload_task.done():
+        return
+
+    song = queues[chat_id][0]
+    preload_chat_id = chat_id
+    preload_task = asyncio.create_task(_preload_next_song(chat_id, song))
 
 
 async def get_audio_url_for_song(chat_id, song):
-    # केवल जरूरत पड़ने पर एक ही audio extraction करें.
+    global preloaded_audio
+    if (
+        preloaded_audio is not None
+        and preloaded_audio[0] == chat_id
+        and preloaded_audio[1] is song
+    ):
+        audio_url = preloaded_audio[2]
+        preloaded_audio = None
+        return audio_url
+
+    task = preload_task
+    if (
+        task is not None
+        and not task.done()
+        and preload_chat_id == chat_id
+    ):
+        await task
+        if (
+            preloaded_audio is not None
+            and preloaded_audio[0] == chat_id
+            and preloaded_audio[1] is song
+        ):
+            audio_url = preloaded_audio[2]
+            preloaded_audio = None
+            return audio_url
+
     async with extraction_semaphore:
         return await asyncio.to_thread(extract_audio_url, song["url"])
 
@@ -960,7 +1025,7 @@ async def main():
         print("🎵 Pandey Music Bot Online!")
         print("🌐 YouTube Search Enabled!")
         print("🎛 Inline Music Controls Enabled!")
-        print("🚫 Queue Preload Disabled!")
+        print("⚡ One-Song Global Smart Preload Enabled!")
         print("🧠 Single Audio Extraction Mode Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
 
