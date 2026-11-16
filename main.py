@@ -7,6 +7,8 @@ import yt_dlp
 import shutil
 import html
 import platform
+import subprocess
+import hashlib
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -44,124 +46,131 @@ if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
 API_ID = int(API_ID_TEXT)
 
 
-# ================= DENO AUTO INSTALLER =================
+# ================= LIGHTWEIGHT QUICKJS-NG RUNTIME =================
 
-def setup_deno():
-    """
-    Deno की official GitHub release डाउनलोड करके
-    server के writable folder में install करने की कोशिश करता है।
-    """
+QJS_DIR = Path("/home/container/.local/bin")
+QJS_BIN = QJS_DIR / "qjs"
 
-    existing = shutil.which("deno")
 
-    if existing:
-        print(f"✅ System Deno Found: {existing}")
-        return existing
-
-    if DENO_BIN.exists():
-        try:
-            os.chmod(DENO_BIN, 0o755)
-            result = subprocess.run(
-                [str(DENO_BIN), "--version"],
-                capture_output=True,
-                text=True,
-                timeout=15
-            )
-
-            if result.returncode == 0:
-                print("✅ पहले से डाउनलोड किया हुआ Deno मिला।")
-                return str(DENO_BIN)
-
-        except Exception as error:
-            print(f"⚠️ Existing Deno इस्तेमाल नहीं हो सका: {error}")
-
-    machine = platform.machine().lower()
-
-    if machine in ("x86_64", "amd64"):
-        asset_name = "deno-x86_64-unknown-linux-gnu.zip"
-    elif machine in ("aarch64", "arm64"):
-        asset_name = "deno-aarch64-unknown-linux-gnu.zip"
-    else:
-        print(f"❌ Unsupported server architecture: {machine}")
-        return None
-
-    if platform.system().lower() != "linux":
-        print("❌ यह installer Linux server के लिए बनाया गया है।")
-        return None
-
-    zip_path = DENO_DIR / "deno-download.zip"
-
+def _check_qjs(path):
+    """सिर्फ वही qjs स्वीकार करें जो वास्तव में executable हो।"""
     try:
-        DENO_DIR.mkdir(parents=True, exist_ok=True)
-
-        download_url = (
-            "https://github.com/denoland/deno/releases/latest/download/"
-            + asset_name
-        )
-
-        print("⬇️ Official Deno download शुरू हो रहा है...")
-
-        response = requests.get(
-            download_url,
-            stream=True,
-            timeout=(15, 120)
-        )
-        response.raise_for_status()
-
-        with open(zip_path, "wb") as file:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    file.write(chunk)
-
-        print("📦 Deno ZIP डाउनलोड पूरा हुआ।")
-
-        with zipfile.ZipFile(zip_path, "r") as archive:
-            if "deno" not in archive.namelist():
-                raise RuntimeError("ZIP में Deno executable नहीं मिला।")
-
-            archive.extract("deno", path=DENO_DIR)
-
-        os.chmod(
-            DENO_BIN,
-            stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR |
-            stat.S_IRGRP | stat.S_IXGRP |
-            stat.S_IROTH | stat.S_IXOTH
-        )
-
         result = subprocess.run(
-            [str(DENO_BIN), "--version"],
+            [str(path), "--version"],
             capture_output=True,
             text=True,
-            timeout=20
+            timeout=5
         )
+        return result.returncode == 0
+    except Exception:
+        return False
 
-        if result.returncode != 0:
-            raise RuntimeError(
-                result.stderr or "Deno executable नहीं चल पाया।"
-            )
 
-        os.environ["PATH"] = (
-            str(DENO_DIR) + os.pathsep + os.environ.get("PATH", "")
+def setup_quickjs():
+    """
+    QuickJS-NG का छोटा prebuilt executable डाउनलोड करें।
+    Node/Deno या कोई भारी Python package install नहीं होता।
+    """
+    # पहले server पर मौजूद qjs को जाँचें।
+    existing = shutil.which("qjs")
+    if existing and _check_qjs(existing):
+        print(f"✅ QuickJS Runtime Found: {existing}")
+        return existing
+
+    if QJS_BIN.exists() and _check_qjs(QJS_BIN):
+        print(f"✅ QuickJS-NG पहले से मौजूद है: {QJS_BIN}")
+        return str(QJS_BIN)
+
+    if platform.system().lower() != "linux":
+        print("⚠️ QuickJS auto-install केवल Linux server के लिए है।")
+        return None
+
+    machine = platform.machine().lower()
+    asset_names = {
+        "x86_64": "qjs-linux-x86_64",
+        "amd64": "qjs-linux-x86_64",
+        "aarch64": "qjs-linux-aarch64",
+        "arm64": "qjs-linux-aarch64",
+        "armv7l": "qjs-linux-armv7",
+    }
+    asset_name = asset_names.get(machine)
+
+    if not asset_name:
+        print(f"⚠️ QuickJS के लिए unsupported architecture: {machine}")
+        return None
+
+    temp_path = QJS_DIR / "qjs.download"
+    try:
+        QJS_DIR.mkdir(parents=True, exist_ok=True)
+
+        print("⬇️ हल्का QuickJS-NG runtime डाउनलोड हो रहा है...")
+
+        api_response = requests.get(
+            "https://api.github.com/repos/quickjs-ng/quickjs/releases/latest",
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=(10, 20)
         )
+        api_response.raise_for_status()
+        release = api_response.json()
 
-        print("✅ Deno Successfully Installed!")
-        print(result.stdout.strip())
+        asset = next(
+            (item for item in release.get("assets", [])
+             if item.get("name") == asset_name),
+            None
+        )
+        if not asset or not asset.get("browser_download_url"):
+            raise RuntimeError(f"GitHub release में {asset_name} नहीं मिला।")
 
-        return str(DENO_BIN)
+        expected_digest = asset.get("digest") or ""
+        if expected_digest and not expected_digest.startswith("sha256:"):
+            raise RuntimeError("GitHub asset का SHA-256 digest उपलब्ध नहीं है।")
+
+        download = requests.get(
+            asset["browser_download_url"],
+            stream=True,
+            timeout=(10, 60)
+        )
+        download.raise_for_status()
+
+        total = 0
+        digest = hashlib.sha256()
+        with open(temp_path, "wb") as file:
+            for chunk in download.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > 15 * 1024 * 1024:
+                    raise RuntimeError("QuickJS binary का आकार सीमा से अधिक है।")
+                digest.update(chunk)
+                file.write(chunk)
+
+        if total < 100_000:
+            raise RuntimeError("डाउनलोड की गई QuickJS file अधूरी है।")
+
+        if expected_digest:
+            actual_digest = "sha256:" + digest.hexdigest()
+            if actual_digest != expected_digest:
+                raise RuntimeError("QuickJS SHA-256 verification असफल हुई।")
+
+        os.chmod(temp_path, 0o755)
+        os.replace(temp_path, QJS_BIN)
+        os.chmod(QJS_BIN, 0o755)
+
+        if not _check_qjs(QJS_BIN):
+            raise RuntimeError("QuickJS executable start नहीं हुआ।")
+
+        print(f"✅ QuickJS-NG Runtime Ready: {QJS_BIN}")
+        return str(QJS_BIN)
 
     except Exception as error:
-        print("❌ Deno Auto Installation असफल!")
-        print(f"कारण: {type(error).__name__}: {error}")
-        print(
-            "ℹ️ SillyDev ने download या executable permission "
-            "रोक रखी हो सकती है।"
-        )
+        print(f"⚠️ QuickJS auto-install नहीं हो पाया: {type(error).__name__}: {error}")
+        print("ℹ️ Bot चलेगा, लेकिन YouTube के कुछ audio formats नहीं मिल सकते।")
         return None
 
     finally:
         try:
-            if zip_path.exists():
-                zip_path.unlink()
+            if temp_path.exists():
+                temp_path.unlink()
         except Exception:
             pass
 
@@ -172,6 +181,7 @@ bot = None
 user = None
 calls = None
 DENO_PATH = None
+QJS_PATH = None
 
 queues = defaultdict(deque)
 current_songs = {}
@@ -316,12 +326,25 @@ def extract_audio_url(video_url):
     runtime_name = None
 
     if YOUTUBE_JS_RUNTIME == "auto":
-        # 256 MB RAM पर qjs को प्राथमिकता दें; Deno जानबूझकर इस्तेमाल नहीं होगा।
-        runtime_path = shutil.which("qjs")
-        runtime_name = "quickjs" if runtime_path else None
-        if not runtime_path:
-            runtime_path = shutil.which("node")
-            runtime_name = "node" if runtime_path else None
+        # QuickJS-NG का executable startup पर validate किया जाता है।
+        runtime_path = QJS_PATH or shutil.which("qjs")
+        runtime_name = "quickjs" if runtime_path and _check_qjs(runtime_path) else None
+        if not runtime_name:
+            # node नाम की Python launcher file को runtime न मानें।
+            node_candidate = shutil.which("node")
+            if node_candidate:
+                try:
+                    node_check = subprocess.run(
+                        [node_candidate, "--version"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if node_check.returncode == 0 and node_check.stdout.strip().startswith("v"):
+                        runtime_path = node_candidate
+                        runtime_name = "node"
+                except Exception:
+                    pass
     elif YOUTUBE_JS_RUNTIME in ("quickjs", "qjs"):
         runtime_path = shutil.which("qjs")
         runtime_name = "quickjs" if runtime_path else None
@@ -956,13 +979,14 @@ def command_handler_with_auto_delete(callback):
 # ================= MAIN =================
 
 async def main():
-    global bot, user, calls, DENO_PATH
+    global bot, user, calls, DENO_PATH, QJS_PATH
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
 
-    # 256 MB RAM: Deno auto-install/start नहीं करेंगे.
+    # 256 MB RAM: Deno/Node नहीं; छोटा QuickJS-NG इस्तेमाल करें।
     DENO_PATH = None
-    print("⚠️ LOW-RAM MODE: preload और Deno disabled; extraction on demand.")
+    QJS_PATH = setup_quickjs()
+    print("⚠️ LOW-RAM MODE: Deno disabled; one-song global preload only.")
 
     bot = Client(
         "PandeyMusicBot",
