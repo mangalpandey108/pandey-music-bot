@@ -30,9 +30,6 @@ API_ID_TEXT = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-YOUTUBE_COOKIES_FILE = os.getenv(
-    "YOUTUBE_COOKIES_FILE", "/home/container/cookies.txt"
-).strip()
 
 # auto = QuickJS (qjs) preferred. Deno disabled.
 # For this 256 MB host, do not set this to node or deno.
@@ -343,11 +340,8 @@ def extract_audio_url(video_url):
         "extract_flat": False,
     }
 
-    if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
-        options["cookiefile"] = YOUTUBE_COOKIES_FILE
-        print("🍪 YouTube cookies file enabled.")
-    else:
-        print("⚠️ cookies.txt नहीं मिली; YouTube verification आ सकता है।")
+    # निजी YouTube login cookies का उपयोग नहीं किया जाता।
+    print("ℹ️ YouTube extraction बिना निजी cookies के प्रयास की जा रही है।")
 
     runtime_path = None
     runtime_name = None
@@ -423,7 +417,7 @@ def extract_audio_url(video_url):
         error_text = str(error)
         if "sign in to confirm you're not a bot" in error_text.casefold():
             raise RuntimeError(
-                "YouTube verification माँग रहा है; server पर valid cookies.txt लगाएँ।"
+                "YouTube ने इस server request को verification के कारण रोक दिया। इस bot से इसे bypass नहीं किया जा सकता; बाद में फिर प्रयास करें या YouTube के समर्थित playback विकल्प का उपयोग करें।"
             ) from error
         raise RuntimeError(
             f"yt-dlp extraction असफल: {error_text[:700]}"
@@ -1041,6 +1035,7 @@ async def main():
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot Online!")
         print("🌐 YouTube Search Enabled!")
+        print("🔒 Private browser cookies are not used.")
         print("🎛 Inline Music Controls Enabled!")
         print("⚡ One-Song Global Smart Preload Enabled!")
         print("🚀 Non-blocking Now Playing Notification Enabled!")
