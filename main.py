@@ -334,26 +334,21 @@ def extract_audio_url(video_url):
 
         audio_url = None
 
-        # 1. सीधे डायरेक्ट यूआरएल जाँचें
         if "url" in info and info["url"]:
             audio_url = info["url"]
 
-        # 2. requested_formats जाँचें
         if not audio_url and "requested_formats" in info:
             for fmt in info.get("requested_formats", []):
                 if fmt.get("url"):
                     audio_url = fmt.get("url")
                     break
 
-        # 3. formats सूची में से ऑडियो या बेस्ट फॉर्मेट ढूँढें
         if not audio_url and "formats" in info:
             formats = info.get("formats", [])
-            # पहले बिना वीडियो वाले केवल ऑडियो फॉर्मेट ढूँढें
             for f in formats:
                 if f.get("url") and f.get("acodec") != "none" and f.get("vcodec") == "none":
                     audio_url = f.get("url")
                     break
-            # यदि केवल ऑडियो न मिले, तो कोई भी उपलब्ध वर्किंग फॉर्मेट ले लें
             if not audio_url:
                 for f in formats:
                     if f.get("url"):
@@ -404,9 +399,10 @@ async def get_audio_url_for_song(chat_id, song):
 # ================= PLAYBACK =================
 
 async def start_song_in_call(chat_id, song, audio_url):
+    # PyTgCalls में स्ट्रीम बिना क्वालिटी बाउंड्री के सीधे प्ले की जा रही है ताकि STREAM ENDED एरर न आए
     await calls.play(
         chat_id,
-        MediaStream(audio_url, AudioQuality.LOW)
+        MediaStream(audio_url)
     )
 
     current_songs[chat_id] = song
