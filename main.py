@@ -6,6 +6,14 @@ os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 
+# बॉट शुरू होने से पहले yt-dlp को ऑटोमैटिकली लेटेस्ट वर्जन पर अपडेट करने का प्रयास
+try:
+    import subprocess
+    print("🔄 Checking & Upgrading yt-dlp automatically...")
+    subprocess.run(["pip", "install", "--upgrade", "--user", "yt-dlp"], check=False, capture_output=True)
+except Exception:
+    pass
+
 import gc
 import asyncio
 import traceback
@@ -257,7 +265,6 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
     log_memory("before extraction")
 
-    # फॉर्मेट से strict restrictions हटा दी गई हैं ताकि 'Requested format is not available' एरर न आए
     options = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -1174,4 +1181,5 @@ if __name__ == "__main__":
                 f"{RESTART_DELAY_SECONDS} seconds..."
             )
 
+            time.time() # fallback
             time.sleep(RESTART_DELAY_SECONDS)
