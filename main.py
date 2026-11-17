@@ -660,6 +660,7 @@ async def skip_music(chat_id):
         return False
 
     finally:
+    # --- यहाँ फिक्स किया गया इंडेंटेशन ---
         skip_in_progress.discard(chat_id)
         cleanup_memory("after skip")
 
@@ -1149,3 +1150,24 @@ if __name__ == "__main__":
     while True:
         try:
             print("🔄 Starting Bot...")
+            asyncio.run(main())
+
+            print("⚠️ Bot stopped normally.")
+            break
+
+        except KeyboardInterrupt:
+            print("🛑 Manual shutdown.")
+            break
+
+        except Exception as error:
+            print(
+                f"💥 BOT ERROR: {type(error).__name__}: {error}"
+            )
+            traceback.print_exc()
+
+            print(
+                f"🔁 Restarting in "
+                f"{RESTART_DELAY_SECONDS} seconds..."
+            )
+
+            time.sleep(RESTART_DELAY_SECONDS)
