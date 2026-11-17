@@ -46,10 +46,6 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-YOUTUBE_COOKIES_FILE = os.getenv(
-    "YOUTUBE_COOKIES_FILE", "/home/container/cookies.txt"
-).strip()
-
 YOUTUBE_JS_RUNTIME = os.getenv("YOUTUBE_JS_RUNTIME", "auto").strip().lower()
 
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
@@ -265,9 +261,9 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
     log_memory("before extraction")
 
+    # कुकीज़ पूरी तरह से हटा दी गई हैं और एंड्रॉइड क्लाइंट का उपयोग किया गया है
     options = {
-        "format": "bestaudio/best",
-        "extractor_args": {"youtube": {"player_client": ["android", "web", "mweb"]}},
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -284,11 +280,7 @@ def extract_audio_url(video_url):
         "logtostderr": False,
     }
 
-    if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
-        options["cookiefile"] = YOUTUBE_COOKIES_FILE
-        print("🍪 YouTube cookies enabled.")
-    else:
-        print("⚠️ cookies.txt नहीं मिली।")
+    print("🚀 Running in Cookie-free Android Client Mode.")
 
     runtime_path = None
     runtime_name = None
@@ -367,12 +359,6 @@ def extract_audio_url(video_url):
 
     except Exception as error:
         error_text = str(error)
-
-        if "sign in to confirm you're not a bot" in error_text.casefold():
-            raise RuntimeError(
-                "YouTube verification माँग रहा है। Cookies जाँचें।"
-            ) from error
-
         raise RuntimeError(
             f"yt-dlp extraction failed: {error_text[:300]}"
         ) from error
@@ -469,17 +455,11 @@ async def play_next(chat_id):
         traceback.print_exc()
 
         try:
-            if "verification" in str(error).casefold():
-                message_text = (
-                    "❌ YouTube verification माँग रहा है।\n"
-                    "Cookies और YouTube access जाँचें।"
-                )
-            else:
-                message_text = (
-                    "❌ यह गाना शुरू नहीं हो पाया:\n"
-                    f"{song.get('title', 'Unknown')}\n\n"
-                    f"कारण: {str(error)[:250]}"
-                )
+            message_text = (
+                "❌ यह गाना शुरू नहीं हो पाया:\n"
+                f"{song.get('title', 'Unknown')}\n\n"
+                f"कारण: {str(error)[:250]}"
+            )
 
             await bot.send_message(chat_id, message_text)
 
@@ -660,7 +640,6 @@ async def skip_music(chat_id):
         return False
 
     finally:
-    # --- यहाँ फिक्स किया गया इंडेंटेशन ---
         skip_in_progress.discard(chat_id)
         cleanup_memory("after skip")
 
@@ -1015,7 +994,7 @@ async def main():
     QJS_PATH = find_quickjs()
 
     print("⚡ LOW RAM MODE ENABLED (256MB Optimized)")
-    print("🚫 Automatic Preload DISABLED")
+    print("🚫 Cookie-free Android Client Mode Enabled")
     print("🧠 Single Extraction Enabled")
     print("🎧 LOW Audio Quality")
     print(f"📋 Queue: Maximum {MAX_QUEUE_SIZE} songs per chat")
@@ -1094,11 +1073,6 @@ async def main():
 
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot ONLINE")
-
-        if Path(YOUTUBE_COOKIES_FILE).is_file():
-            print("🍪 YouTube Cookies Enabled")
-        else:
-            print("⚠️ YouTube cookies.txt not found")
 
         log_memory("online")
 
