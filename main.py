@@ -1,4 +1,5 @@
 import os
+import gc
 import asyncio
 import traceback
 import time
@@ -10,7 +11,6 @@ import html
 from pathlib import Path
 from collections import defaultdict, deque
 from itertools import islice
-
 from dotenv import load_dotenv
 
 from pyrogram import Client, filters, enums
@@ -31,21 +31,21 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 YOUTUBE_COOKIES_FILE = os.getenv(
-    "YOUTUBE_COOKIES_FILE",
-    "/home/container/cookies.txt"
+    "YOUTUBE_COOKIES_FILE", "/home/container/cookies.txt"
 ).strip()
-
-YOUTUBE_JS_RUNTIME = os.getenv(
-    "YOUTUBE_JS_RUNTIME",
-    "auto"
-).strip().lower()
+YOUTUBE_JS_RUNTIME = os.getenv("YOUTUBE_JS_RUNTIME", "auto").strip().lower()
 
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
     raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
 
 API_ID = int(API_ID_TEXT)
 
-MAX_QUEUE_SIZE = 50
+# None का अर्थ Unlimited Queue है। बहुत बड़ी queue थोड़ी RAM इस्तेमाल करेगी।
+MAX_QUEUE_SIZE = None
+
+# एक समय में केवल एक yt-dlp extraction।
+# Extraction thread को timeout से cancel करना सुरक्षित नहीं होता, इसलिए timeout नहीं लगाया गया।
+
 
 # ================= GLOBALS =================
 
@@ -53,6 +53,7 @@ bot = None
 user = None
 calls = None
 QJS_PATH = None
+extraction_semaphore = None
 
 queues = defaultdict(deque)
 current_songs = {}
@@ -62,28 +63,67 @@ playback_starting = set()
 skip_in_progress = set()
 stop_in_progress = set()
 failed_chats = set()
-
-# एक समय में केवल एक yt-dlp extraction
-extraction_semaphore = None
-
-# Stop के बाद पुराने extraction को playback शुरू करने से रोकता है
 chat_generation = defaultdict(int)
 
 http = requests.Session()
 
 
+# ================= MEMORY HELPERS =================
+
+def read_int_file(path):
+    try:
+        value = Path(path).read_text().strip()
+        if value.isdigit():
+            return int(value)
+    except Exception:
+        pass
+    return None
+
+
+def memory_snapshot():
+    current = read_int_file("/sys/fs/cgroup/memory.current")
+    limit = read_int_file("/sys/fs/cgroup/memory.max")
+
+    if current is not None and limit is not None and limit > 0:
+        return current / 1048576, limit / 1048576, "cgroup-v2"
+
+    current = read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    limit = read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+    if current is not None and limit is not None and 0 < limit < (1 << 60):
+        return current / 1048576, limit / 1048576, "cgroup-v1"
+
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024, 256.0, "process-rss"
+    except Exception:
+        pass
+
+    return None, None, "unavailable"
+
+
+def log_memory(label):
+    used, limit, source = memory_snapshot()
+    if used is not None:
+        print(f"🧠 RAM {label}: {used:.1f}/{limit:.1f} MiB ({source})")
+
+
+def cleanup_memory(label="cleanup"):
+    # Python की unused objects साफ करता है; FFmpeg/native memory पर पूरा नियंत्रण नहीं है।
+    gc.collect()
+    log_memory(label)
+
+
 # ================= QUICKJS =================
 
 def find_quickjs():
-
     existing = shutil.which("qjs")
-
     if existing:
         print(f"✅ QuickJS Found: {existing}")
         return existing
 
     local_qjs = Path("/home/container/.local/bin/qjs")
-
     if local_qjs.is_file() and os.access(local_qjs, os.X_OK):
         print(f"✅ QuickJS Found: {local_qjs}")
         return str(local_qjs)
@@ -92,76 +132,9 @@ def find_quickjs():
     return None
 
 
-# ================= MEMORY MONITOR =================
-
-def read_int_file(path):
-
-    try:
-        value = Path(path).read_text().strip()
-
-        if value.isdigit():
-            return int(value)
-
-    except Exception:
-        pass
-
-    return None
-
-
-def memory_snapshot():
-
-    current = read_int_file("/sys/fs/cgroup/memory.current")
-    limit = read_int_file("/sys/fs/cgroup/memory.max")
-
-    if current is not None and limit is not None and limit > 0:
-        return (
-            current / (1024 * 1024),
-            limit / (1024 * 1024),
-            "cgroup-v2"
-        )
-
-    current = read_int_file(
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes"
-    )
-
-    limit = read_int_file(
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes"
-    )
-
-    if current is not None and limit is not None and 0 < limit < (1 << 60):
-        return (
-            current / (1024 * 1024),
-            limit / (1024 * 1024),
-            "cgroup-v1"
-        )
-
-    try:
-        for line in Path("/proc/self/status").read_text().splitlines():
-            if line.startswith("VmRSS:"):
-                rss = int(line.split()[1]) / 1024
-                return rss, 256.0, "process-rss"
-
-    except Exception:
-        pass
-
-    return None, None, "unavailable"
-
-
-def log_memory(label):
-
-    used, limit, source = memory_snapshot()
-
-    if used is not None:
-        print(
-            f"🧠 RAM {label}: "
-            f"{used:.1f}/{limit:.1f} MB ({source})"
-        )
-
-
 # ================= BUTTONS =================
 
 def music_buttons():
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("▶️ Resume", callback_data="music:resume"),
@@ -175,27 +148,19 @@ def music_buttons():
             InlineKeyboardButton("📋 Queue", callback_data="music:queue"),
             InlineKeyboardButton("🎵 Play", callback_data="music:play")
         ],
-        [
-            InlineKeyboardButton("🛑 End", callback_data="music:end")
-        ]
+        [InlineKeyboardButton("🛑 End", callback_data="music:end")]
     ])
 
 
 def requester_tag(song):
-
     user_id = song.get("requester_id")
-    name = song.get("requester_name") or "Unknown User"
-
-    safe_name = html.escape(name)
-
+    name = html.escape(song.get("requester_name") or "Unknown User")
     if user_id:
-        return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
-
-    return safe_name
+        return f'<a href="tg://user?id={user_id}">{name}</a>'
+    return name
 
 
 async def send_now_playing(chat_id, song):
-
     title = html.escape(song.get("title", "Unknown Song"))
     requested_by = requester_tag(song)
 
@@ -206,25 +171,29 @@ async def send_now_playing(chat_id, song):
         "🎛 <b>Music Controls</b>"
     )
 
+    old_message = now_playing_messages.get(chat_id)
+    if old_message:
+        try:
+            await old_message.delete()
+        except Exception:
+            pass
+
     sent = await bot.send_message(
         chat_id,
         text,
         reply_markup=music_buttons(),
         parse_mode=enums.ParseMode.HTML
     )
-
     now_playing_messages[chat_id] = sent
 
 
 # ================= YOUTUBE SEARCH =================
 
 def search_youtube(query):
-
     if not YOUTUBE_API_KEY:
         raise ValueError("YOUTUBE_API_KEY नहीं मिली।")
 
     started = time.perf_counter()
-
     response = http.get(
         "https://www.googleapis.com/youtube/v3/search",
         params={
@@ -236,22 +205,16 @@ def search_youtube(query):
         },
         timeout=(5, 10)
     )
-
     response.raise_for_status()
 
     items = response.json().get("items", [])
-
-    print(
-        f"🔎 YouTube Search: "
-        f"{time.perf_counter() - started:.2f}s"
-    )
+    print(f"🔎 YouTube Search: {time.perf_counter() - started:.2f}s")
 
     if not items:
         return None
 
     item = items[0]
     video_id = item["id"]["videoId"]
-
     return {
         "title": item["snippet"]["title"],
         "url": f"https://www.youtube.com/watch?v={video_id}",
@@ -262,30 +225,22 @@ def search_youtube(query):
 # ================= AUDIO EXTRACTION =================
 
 def extract_audio_url(video_url):
-
     started = time.perf_counter()
-
     log_memory("before extraction")
 
     options = {
-        # कम bitrate वाला audio पहले चुनेगा
-        "format": "worstaudio/best",
-
+        "format": "bestaudio[abr<=96]/bestaudio/worstaudio/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-
-        "socket_timeout": 10,
-
+        "socket_timeout": 12,
         "retries": 0,
         "extractor_retries": 0,
         "fragment_retries": 0,
-
         "cachedir": False,
         "noprogress": True,
-
-        "concurrent_fragment_downloads": 1
+        "concurrent_fragment_downloads": 1,
     }
 
     if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
@@ -299,44 +254,31 @@ def extract_audio_url(video_url):
 
     if YOUTUBE_JS_RUNTIME == "auto":
         runtime_path = QJS_PATH
-
         if runtime_path:
             runtime_name = "quickjs"
-
     elif YOUTUBE_JS_RUNTIME in ("quickjs", "qjs"):
         runtime_path = QJS_PATH or shutil.which("qjs")
-
         if runtime_path:
             runtime_name = "quickjs"
-
     elif YOUTUBE_JS_RUNTIME == "node":
-        print("⚠️ LOW RAM MODE: Node disabled.")
-
+        print("⚠️ Node runtime इस LOW RAM config में enable नहीं किया गया।")
     elif YOUTUBE_JS_RUNTIME:
         candidate = Path(YOUTUBE_JS_RUNTIME)
-
         if candidate.is_file():
             runtime_path = str(candidate)
-            runtime_name = (
-                "quickjs" if candidate.name == "qjs" else "custom"
-            )
+            runtime_name = "quickjs" if candidate.name == "qjs" else "custom"
 
     if runtime_path and runtime_name:
-        options["js_runtimes"] = {
-            runtime_name: {
-                "path": runtime_path
-            }
-        }
-
+        options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
         print(f"✅ yt-dlp JS runtime: {runtime_path}")
-
     else:
         print("⚠️ JS runtime unavailable.")
 
+    ydl = None
+    info = None
     try:
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(video_url, download=False)
+        ydl = yt_dlp.YoutubeDL(options)
+        info = ydl.extract_info(video_url, download=False)
 
         if not info:
             raise RuntimeError("YouTube information नहीं मिली।")
@@ -344,80 +286,59 @@ def extract_audio_url(video_url):
         audio_url = info.get("url")
 
         if not audio_url:
-
             formats = info.get("formats") or []
-            best_format = None
-            best_score = (-1, -1)
+            audio_formats = [
+                item for item in formats
+                if item.get("url") and item.get("acodec") not in (None, "none")
+            ]
 
-            for item in formats:
-
-                if not item.get("url"):
-                    continue
-
-                if item.get("acodec") in (None, "none"):
-                    continue
-
-                score = (
-                    item.get("abr") or 0,
-                    item.get("tbr") or 0
-                )
-
-                if score > best_score:
-                    best_score = score
-                    best_format = item
-
-            if best_format:
-                audio_url = best_format.get("url")
+            audio_only = [
+                item for item in audio_formats
+                if item.get("vcodec") in (None, "none")
+            ]
+            candidates = audio_only or audio_formats
+            candidates.sort(
+                key=lambda item: item.get("abr") or item.get("tbr") or 9999
+            )
+            if candidates:
+                audio_url = candidates[0].get("url")
 
         if not audio_url:
             raise RuntimeError("Audio URL नहीं मिली।")
 
-        print(
-            f"⚡ Extraction Time: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
-
+        print(f"⚡ Extraction Time: {time.perf_counter() - started:.2f}s")
         return audio_url
 
     except yt_dlp.utils.DownloadError as error:
-
         error_text = str(error)
-
         if "sign in to confirm you're not a bot" in error_text.casefold():
             raise RuntimeError(
                 "YouTube verification माँग रहा है। Cookies जाँचें।"
             ) from error
-
-        raise RuntimeError(
-            f"yt-dlp failed: {error_text[:500]}"
-        ) from error
+        raise RuntimeError(f"yt-dlp failed: {error_text[:400]}") from error
 
     finally:
-        log_memory("after extraction")
+        info = None
+        if ydl is not None:
+            try:
+                ydl.close()
+            except Exception:
+                pass
+        ydl = None
+        cleanup_memory("after extraction")
 
-
-# ================= AUDIO URL =================
 
 async def get_audio_url_for_song(chat_id, song):
-
     async with extraction_semaphore:
-
-        return await asyncio.to_thread(
-            extract_audio_url,
-            song["url"]
-        )
+        return await asyncio.to_thread(extract_audio_url, song["url"])
 
 
 # ================= PLAYBACK =================
 
 async def start_song_in_call(chat_id, song, audio_url):
-
     await calls.play(
         chat_id,
-        MediaStream(
-            audio_url,
-            AudioQuality.LOW
-        )
+        MediaStream(audio_url, AudioQuality.LOW)
     )
 
     current_songs[chat_id] = song
@@ -425,7 +346,6 @@ async def start_song_in_call(chat_id, song, audio_url):
 
     try:
         await send_now_playing(chat_id, song)
-
     except Exception as error:
         print(f"⚠️ Now Playing error: {error}")
 
@@ -433,247 +353,201 @@ async def start_song_in_call(chat_id, song, audio_url):
 # ================= PLAY NEXT =================
 
 async def play_next(chat_id):
-
-    if chat_id in playback_starting:
+    if chat_id in playback_starting or chat_id in stop_in_progress:
         return False
-
-    if chat_id in stop_in_progress:
-        return False
-
     if not queues[chat_id]:
         return False
 
     playback_starting.add(chat_id)
-
     song = queues[chat_id].popleft()
     generation = chat_generation[chat_id]
 
     try:
-
         started = time.perf_counter()
-
         print(f"🎧 Trying: {song['title']}")
 
         audio_url = await get_audio_url_for_song(chat_id, song)
 
-        # Stop या End के बाद पुराने गाने को शुरू न करें
-        if (
-            chat_id in stop_in_progress
-            or generation != chat_generation[chat_id]
-        ):
+        if chat_id in stop_in_progress or generation != chat_generation[chat_id]:
             print("ℹ️ Old extraction discarded.")
             return False
 
         vc_started = time.perf_counter()
-
         await start_song_in_call(chat_id, song, audio_url)
 
-        print(
-            f"📡 VC Switch: "
-            f"{time.perf_counter() - vc_started:.2f}s"
-        )
-
-        print(
-            f"🎵 Total Start: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
-
+        print(f"📡 VC Switch: {time.perf_counter() - vc_started:.2f}s")
+        print(f"🎵 Total Start: {time.perf_counter() - started:.2f}s")
         return True
 
     except Exception as error:
-
         current_songs.pop(chat_id, None)
         failed_chats.add(chat_id)
-
         print(f"❌ Song Failed: {song.get('title')}")
         print(f"Error: {error}")
-
         traceback.print_exc()
 
         try:
-
             if "verification" in str(error).casefold():
-                text = (
+                message_text = (
                     "❌ YouTube verification माँग रहा है।\n"
-                    "यह गाना नहीं चल पाया।"
+                    "Cookies और YouTube access जाँचें।"
                 )
             else:
-                text = (
+                message_text = (
                     "❌ यह गाना शुरू नहीं हो पाया:\n"
                     f"{song.get('title', 'Unknown')}"
                 )
-
-            await bot.send_message(chat_id, text)
-
+            await bot.send_message(chat_id, message_text)
         except Exception:
             pass
-
         return False
 
     finally:
         playback_starting.discard(chat_id)
+        cleanup_memory("play-next-finished")
 
 
 # ================= QUEUE TEXT =================
 
 def make_queue_text(chat_id):
-
     current = current_songs.get(chat_id)
     queue = queues[chat_id]
-
     text = "🎵 MUSIC QUEUE\n\n"
 
     if current:
-        text += (
-            "▶️ अभी बज रहा है:\n"
-            f"{current['title']}\n\n"
-        )
+        text += f"▶️ अभी बज रहा है:\n{current['title']}\n\n"
 
     if queue:
-
         text += "📋 आने वाले गाने:\n"
-
         for number, song in enumerate(islice(queue, 15), start=1):
             text += f"{number}. {song['title']}\n"
-
         if len(queue) > 15:
             text += f"\nऔर {len(queue) - 15} गाने बाकी हैं।"
 
     if not current and not queue:
         text = "📭 Queue खाली है।"
-
     return text
 
 
 # ================= STREAM END =================
 
 async def stream_ended_handler(_, update: StreamEnded):
-
     chat_id = update.chat_id
-
     print(f"🏁 STREAM ENDED: {chat_id}")
 
     if chat_id in skip_in_progress or chat_id in stop_in_progress:
         return
-
-    if chat_id not in current_songs:
-        return
-
-    if chat_id in failed_chats:
+    if chat_id not in current_songs or chat_id in failed_chats:
         return
 
     current_songs.pop(chat_id, None)
-    now_playing_messages.pop(chat_id, None)
+    old_message = now_playing_messages.pop(chat_id, None)
+    if old_message:
+        try:
+            await old_message.delete()
+        except Exception:
+            pass
 
     if queues[chat_id]:
         await play_next(chat_id)
-
     else:
-        await bot.send_message(
-            chat_id,
-            "🎵 Queue समाप्त हो गई।"
-        )
+        try:
+            await bot.send_message(chat_id, "🎵 Queue समाप्त हो गई।")
+        except Exception:
+            pass
 
 
 # ================= STOP =================
 
 async def stop_music(chat_id):
-
     stop_in_progress.add(chat_id)
     chat_generation[chat_id] += 1
 
     try:
-
         queues[chat_id].clear()
         current_songs.pop(chat_id, None)
         failed_chats.discard(chat_id)
-        now_playing_messages.pop(chat_id, None)
 
-        await calls.leave_call(chat_id)
+        old_message = now_playing_messages.pop(chat_id, None)
+        if old_message:
+            try:
+                await old_message.delete()
+            except Exception:
+                pass
+
+        try:
+            await calls.leave_call(chat_id)
+        except Exception as error:
+            print(f"ℹ️ leave_call: {error}")
 
         return True
-
     finally:
         stop_in_progress.discard(chat_id)
+        cleanup_memory("after stop")
 
 
 # ================= SKIP =================
 
 async def skip_music(chat_id):
-
-    if chat_id in skip_in_progress:
+    if chat_id in skip_in_progress or chat_id in stop_in_progress:
         return False
-
-    if chat_id in stop_in_progress:
-        return False
-
     if chat_id not in current_songs:
         return False
 
     skip_in_progress.add(chat_id)
-
     generation = chat_generation[chat_id]
 
     try:
-
         if not queues[chat_id]:
-
             current_songs.pop(chat_id, None)
-            now_playing_messages.pop(chat_id, None)
-
+            old_message = now_playing_messages.pop(chat_id, None)
+            if old_message:
+                try:
+                    await old_message.delete()
+                except Exception:
+                    pass
             try:
                 await calls.pause_stream(chat_id)
             except Exception:
                 pass
-
             return True
 
         next_song = queues[chat_id].popleft()
-
         print(f"⏭️ SKIP TO: {next_song['title']}")
 
-        audio_url = await get_audio_url_for_song(
-            chat_id,
-            next_song
-        )
+        # नया URL तैयार होने तक वर्तमान stream चलती रहेगी।
+        audio_url = await get_audio_url_for_song(chat_id, next_song)
 
-        if (
-            chat_id in stop_in_progress
-            or generation != chat_generation[chat_id]
-        ):
+        if chat_id in stop_in_progress or generation != chat_generation[chat_id]:
             print("ℹ️ Skip extraction discarded.")
             return False
 
-        await start_song_in_call(
-            chat_id,
-            next_song,
-            audio_url
-        )
-
+        await start_song_in_call(chat_id, next_song, audio_url)
         print(f"✅ SKIP COMPLETE: {chat_id}")
-
         return True
 
     except Exception as error:
-
         print(f"❌ SKIP ERROR: {error}")
         traceback.print_exc()
-
+        try:
+            await bot.send_message(
+                chat_id,
+                f"❌ अगला गाना शुरू नहीं हो पाया: {str(error)[:250]}"
+            )
+        except Exception:
+            pass
         return False
 
     finally:
         skip_in_progress.discard(chat_id)
+        cleanup_memory("after skip")
 
 
 # ================= BUTTON CALLBACK =================
 
 async def music_callback(client, query):
-
     if not query.message:
-        await query.answer(
-            "यह बटन उपलब्ध नहीं है।",
-            show_alert=True
-        )
+        await query.answer("यह बटन उपलब्ध नहीं है।", show_alert=True)
         return
 
     chat_id = query.message.chat.id
@@ -686,116 +560,53 @@ async def music_callback(client, query):
         )
         return
 
-    if action == "pause":
-
+    if action in ("pause", "resume"):
+        if chat_id not in current_songs:
+            await query.answer("अभी कोई गाना नहीं चल रहा।", show_alert=True)
+            return
         try:
-
-            if chat_id not in current_songs:
-                await query.answer(
-                    "अभी कोई गाना नहीं चल रहा।",
-                    show_alert=True
-                )
-                return
-
-            await calls.pause_stream(chat_id)
-            await query.answer("⏸️ Pause हो गया।")
-
+            if action == "pause":
+                await calls.pause_stream(chat_id)
+                await query.answer("⏸️ Pause हो गया।")
+            else:
+                await calls.resume_stream(chat_id)
+                await query.answer("▶️ Resume हो गया।")
         except Exception as error:
-
-            print(f"PAUSE ERROR: {error}")
-
-            await query.answer(
-                "Pause नहीं हो पाया।",
-                show_alert=True
-            )
-
-        return
-
-    if action == "resume":
-
-        try:
-
-            if chat_id not in current_songs:
-                await query.answer(
-                    "अभी कोई गाना नहीं चल रहा।",
-                    show_alert=True
-                )
-                return
-
-            await calls.resume_stream(chat_id)
-            await query.answer("▶️ Resume हो गया।")
-
-        except Exception as error:
-
-            print(f"RESUME ERROR: {error}")
-
-            await query.answer(
-                "Resume नहीं हो पाया।",
-                show_alert=True
-            )
-
+            print(f"{action.upper()} ERROR: {error}")
+            await query.answer(f"{action.title()} नहीं हो पाया।", show_alert=True)
         return
 
     if action == "skip":
-
         if chat_id not in current_songs:
-            await query.answer(
-                "अभी कोई गाना नहीं चल रहा।",
-                show_alert=True
-            )
+            await query.answer("अभी कोई गाना नहीं चल रहा।", show_alert=True)
             return
-
         await query.answer("⏭️ अगला गाना शुरू हो रहा है।")
-
         success = await skip_music(chat_id)
-
         if not success and not queues[chat_id]:
             await bot.send_message(chat_id, "📭 Queue खाली है।")
-
         return
 
     if action in ("stop", "end"):
-
         try:
-
             await stop_music(chat_id)
-
             await query.answer("⏹️ Playback बंद हो गया।")
-
-            await bot.send_message(
-                chat_id,
-                "⏹️ Music बंद और Queue साफ।"
-            )
-
+            await bot.send_message(chat_id, "⏹️ Music बंद और Queue साफ।")
         except Exception as error:
-
             print(f"STOP ERROR: {error}")
-
-            await query.answer(
-                "Stop नहीं हो पाया।",
-                show_alert=True
-            )
-
+            await query.answer("Stop नहीं हो पाया।", show_alert=True)
         return
 
     if action == "queue":
-
         await query.answer("📋 Queue भेज दी गई।")
-
-        await bot.send_message(
-            chat_id,
-            make_queue_text(chat_id)
-        )
-
+        await bot.send_message(chat_id, make_queue_text(chat_id))
         return
 
     await query.answer("Unknown button.", show_alert=True)
 
 
-# ================= START =================
+# ================= COMMANDS =================
 
 async def start_command(client, message):
-
     await message.reply_text(
         "🎵 Pandey Music Bot ऑनलाइन है!\n\n"
         "Commands:\n"
@@ -810,66 +621,40 @@ async def start_command(client, message):
     )
 
 
-# ================= PLAY COMMAND =================
-
 async def play_command(client, message):
-
     chat_id = message.chat.id
-
-    print(
-        f"🎵 PLAY COMMAND | "
-        f"Chat: {chat_id} | Message: {message.id}"
-    )
+    print(f"🎵 PLAY COMMAND | Chat: {chat_id} | Message: {message.id}")
 
     if len(message.command) < 2:
         await message.reply_text("🎵 लिखें:\n/play गाने का नाम")
         return
 
     query = " ".join(message.command[1:]).strip()
-
-    status = await message.reply_text(
-        "🔎 YouTube पर गाना खोज रहा हूँ..."
-    )
+    status = await message.reply_text("🔎 YouTube पर गाना खोज रहा हूँ...")
 
     try:
-
         started = time.perf_counter()
-
-        song = await asyncio.to_thread(
-            search_youtube,
-            query
-        )
+        song = await asyncio.to_thread(search_youtube, query)
 
         if not song:
             await status.edit_text("❌ YouTube पर गाना नहीं मिला।")
             return
 
         requester = message.from_user
-
         if requester:
-
             song["requester_id"] = requester.id
-
             song["requester_name"] = (
-                requester.first_name
-                or requester.username
-                or "User"
+                requester.first_name or requester.username or "User"
             )
-
         else:
-
             song["requester_id"] = None
-            song["requester_name"] = "Group Admin"
+            song["requester_name"] = "Group User"
 
-        print(
-            f"🔎 Total Search: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
+        print(f"🔎 Total Search: {time.perf_counter() - started:.2f}s")
 
-        if len(queues[chat_id]) >= MAX_QUEUE_SIZE:
+        if MAX_QUEUE_SIZE is not None and len(queues[chat_id]) >= MAX_QUEUE_SIZE:
             await status.edit_text(
-                f"⚠️ Queue भर गई है। अधिकतम "
-                f"{MAX_QUEUE_SIZE} गाने रख सकते हैं।"
+                f"⚠️ Queue भर गई है। अधिकतम {MAX_QUEUE_SIZE} गाने रख सकते हैं।"
             )
             return
 
@@ -880,197 +665,125 @@ async def play_command(client, message):
             or chat_id in playback_starting
             or chat_id in skip_in_progress
         ):
-
             await status.edit_text(
-                f"✅ Queue में जोड़ा गया:\n"
-                f"{song['title']}\n"
+                f"✅ Queue में जोड़ा गया:\n{song['title']}\n"
                 f"स्थान: {len(queues[chat_id])}"
             )
-
             return
 
-        await status.edit_text(
-            f"⚡ Audio तैयार हो रहा है:\n"
-            f"{song['title']}"
-        )
-
+        await status.edit_text(f"⚡ Audio तैयार हो रहा है:\n{song['title']}")
         success = await play_next(chat_id)
 
         if success:
-            await status.delete()
+            try:
+                await status.delete()
+            except Exception:
+                pass
         else:
             await status.edit_text("❌ गाना शुरू नहीं हो पाया।")
 
     except requests.HTTPError as error:
-
         print(f"YOUTUBE API ERROR: {error}")
-
-        await status.edit_text(
-            "❌ YouTube API Error। API key और quota जाँचें।"
-        )
-
+        await status.edit_text("❌ YouTube API Error। API key और quota जाँचें।")
     except Exception as error:
-
-        print(
-            f"PLAY ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
-
+        print(f"PLAY ERROR: {type(error).__name__}: {error}")
         traceback.print_exc()
-
         try:
-            await status.edit_text(
-                "❌ गाना खोजने या चलाने में समस्या हुई।"
-            )
+            await status.edit_text("❌ गाना खोजने या चलाने में समस्या हुई।")
         except Exception:
             pass
 
 
-# ================= PAUSE =================
-
 async def pause_command(client, message):
-
     chat_id = message.chat.id
-
     try:
-
         if chat_id not in current_songs:
             await message.reply_text("❌ अभी कोई गाना नहीं चल रहा।")
             return
-
         await calls.pause_stream(chat_id)
         await message.reply_text("⏸️ गाना Pause हो गया।")
-
     except Exception as error:
-
         print(f"PAUSE ERROR: {error}")
         await message.reply_text("❌ Pause नहीं हो पाया।")
 
 
-# ================= RESUME =================
-
 async def resume_command(client, message):
-
     chat_id = message.chat.id
-
     try:
-
         if chat_id not in current_songs:
             await message.reply_text("❌ अभी कोई गाना नहीं चल रहा।")
             return
-
         await calls.resume_stream(chat_id)
         await message.reply_text("▶️ गाना Resume हो गया।")
-
     except Exception as error:
-
         print(f"RESUME ERROR: {error}")
         await message.reply_text("❌ Resume नहीं हो पाया।")
 
 
-# ================= SKIP COMMAND =================
-
 async def skip_command(client, message):
-
     chat_id = message.chat.id
-
     try:
-
         if chat_id not in current_songs:
             await message.reply_text("❌ अभी कोई गाना नहीं चल रहा।")
             return
-
         success = await skip_music(chat_id)
-
-        if success:
-            await message.reply_text("⏭️ Skip हो गया।")
-        else:
-            await message.reply_text(
-                "📭 अगला गाना उपलब्ध नहीं है या Skip असफल हुआ।"
-            )
-
+        await message.reply_text(
+            "⏭️ Skip हो गया।" if success
+            else "📭 अगला गाना उपलब्ध नहीं है या Skip असफल हुआ।"
+        )
     except Exception as error:
-
         print(f"SKIP ERROR: {error}")
         await message.reply_text("❌ Skip नहीं हो पाया।")
 
 
-# ================= STOP COMMAND =================
-
 async def stop_command(client, message):
-
     chat_id = message.chat.id
-
     try:
-
         await stop_music(chat_id)
-
-        await message.reply_text(
-            "⏹️ Playback बंद और Queue साफ कर दी गई।"
-        )
-
+        await message.reply_text("⏹️ Playback बंद और Queue साफ कर दी गई।")
     except Exception as error:
-
         print(f"STOP ERROR: {error}")
         await message.reply_text("❌ Stop नहीं हो पाया।")
 
-
-# ================= END COMMAND =================
 
 async def end_command(client, message):
     await stop_command(client, message)
 
 
-# ================= QUEUE COMMAND =================
-
 async def queue_command(client, message):
-
-    await message.reply_text(
-        make_queue_text(message.chat.id)
-    )
+    await message.reply_text(make_queue_text(message.chat.id))
 
 
 # ================= AUTO DELETE =================
 
 def command_handler_with_auto_delete(callback):
-
     async def wrapped(client, message):
-
         try:
             await message.delete()
-
-            print(
-                f"🗑️ Command deleted: "
-                f"{message.text or message.caption}"
-            )
-
+            print(f"🗑️ Command deleted: {message.text or message.caption}")
         except Exception:
+            # Delete permission न होने पर command रहने दें।
             pass
-
         return await callback(client, message)
-
     return wrapped
 
 
 # ================= MAIN =================
 
 async def main():
-
-    global bot, user, calls
-    global QJS_PATH, extraction_semaphore
+    global bot, user, calls, QJS_PATH, extraction_semaphore
 
     extraction_semaphore = asyncio.Semaphore(1)
 
     print("🤖 Pandey Music Bot Starting...")
-
     log_memory("startup")
-
     QJS_PATH = find_quickjs()
 
     print("⚡ LOW RAM MODE ENABLED")
     print("🚫 Automatic Preload DISABLED")
     print("🧠 Single Extraction Enabled")
-    print("🎧 Low Bitrate Audio Preferred")
+    print("🎧 LOW Audio Quality")
+    print("📋 Queue: Unlimited")
     print("👷 Pyrogram Workers: 1")
 
     bot = Client(
@@ -1082,7 +795,7 @@ async def main():
         max_concurrent_transmissions=1
     )
 
-    # PyTgCalls के लिए normal Telegram user session जरूरी है
+    # PyTgCalls के लिए Normal Telegram user session जरूरी है।
     user = Client(
         "FreshLogin",
         api_id=API_ID,
@@ -1105,7 +818,6 @@ async def main():
     ]
 
     try:
-
         await bot.start()
         print("✅ Bot Client Started")
 
@@ -1113,62 +825,47 @@ async def main():
         print("✅ User Client Started")
 
         me = await user.get_me()
-
         print(f"👤 Account: {me.first_name}")
         print(f"🆔 Account ID: {me.id}")
 
         if me.is_bot:
-            raise RuntimeError(
-                "FreshLogin में Normal User Account आवश्यक है।"
-            )
+            raise RuntimeError("FreshLogin में Normal User Account आवश्यक है।")
 
         await calls.start()
         print("✅ PyTgCalls Started")
 
-        calls.on_update(
-            call_filters.stream_end()
-        )(stream_ended_handler)
+        calls.on_update(call_filters.stream_end())(stream_ended_handler)
 
         for command_name, callback in handlers:
-
             bot.add_handler(
                 MessageHandler(
                     command_handler_with_auto_delete(callback),
                     filters.command(command_name)
                 )
             )
-
             print(f"✅ /{command_name} Registered")
 
         bot.add_handler(
-            CallbackQueryHandler(
-                music_callback,
-                filters.regex(r"^music:")
-            )
+            CallbackQueryHandler(music_callback, filters.regex(r"^music:"))
         )
 
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot ONLINE")
-        print("🍪 YouTube Cookies Enabled")
-        print("🚫 Preload Disabled")
-        print("🧠 Single Extraction Enabled")
-
+        print(
+            "🍪 YouTube Cookies Enabled"
+            if Path(YOUTUBE_COOKIES_FILE).is_file()
+            else "⚠️ YouTube cookies.txt not found"
+        )
         log_memory("online")
 
         await asyncio.Event().wait()
 
     except Exception as error:
-
-        print(
-            f"❌ MAIN ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
-
+        print(f"❌ MAIN ERROR: {type(error).__name__}: {error}")
         traceback.print_exc()
         raise
 
     finally:
-
         print("🛑 Bot Shutting Down...")
 
         try:
@@ -1194,42 +891,26 @@ async def main():
         except Exception:
             pass
 
+        cleanup_memory("shutdown")
         print("✅ Shutdown Complete")
 
 
 # ================= AUTO RESTART =================
 
 if __name__ == "__main__":
-
     RESTART_DELAY_SECONDS = 10
 
     while True:
-
         try:
-
             print("🔄 Starting Bot...")
-
             asyncio.run(main())
-
             print("⚠️ Bot stopped normally.")
-
+            break
         except KeyboardInterrupt:
-
             print("🛑 Manual shutdown.")
             break
-
         except Exception as error:
-
-            print(
-                f"💥 BOT ERROR: "
-                f"{type(error).__name__}: {error}"
-            )
-
+            print(f"💥 BOT ERROR: {type(error).__name__}: {error}")
             traceback.print_exc()
-
-            print(
-                f"🔁 Restarting in "
-                f"{RESTART_DELAY_SECONDS} seconds..."
-            )
-
-        time.sleep(RESTART_DELAY_SECONDS)
+            print(f"🔁 Restarting in {RESTART_DELAY_SECONDS} seconds...")
+            time.sleep(RESTART_DELAY_SECONDS)
