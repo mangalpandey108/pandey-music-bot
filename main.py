@@ -14,6 +14,7 @@ import requests
 import yt_dlp
 import shutil
 import html
+import ctypes
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -51,7 +52,7 @@ API_ID = int(API_ID_TEXT)
 # Small-server safety: cap queued songs per chat to avoid unbounded RAM growth.
 MAX_QUEUE_SIZE = 20
 
-# एक समय में केवल एक extraction
+# एक समय में केवल एक extraction ताकि रैम पर एकसाथ लोड न पड़े
 EXTRACTION_SEMAPHORE_LIMIT = 1
 
 
@@ -76,8 +77,9 @@ chat_generation = defaultdict(int)
 http = requests.Session()
 # Keep the HTTP connection pool small; only one YouTube API search runs at a time.
 http.mount('https://', requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1))
-# More frequent cyclic collection helps long-running low-memory containers.
-gc.set_threshold(200, 5, 5)
+
+# 256MB RAM सीमा के लिए आक्रामक गार्बेज कलेक्शन थ्रेशोल्ड
+gc.set_threshold(50, 2, 2)
 
 
 # ================= MEMORY =================
@@ -123,6 +125,12 @@ def log_memory(label):
 
 def cleanup_memory(label="cleanup"):
     gc.collect()
+    try:
+        # पाइथन द्वारा रोकी गई फालतू रैम को सीधे ऑपरेटिंग सिस्टम को वापस लौटाना (256MB RAM के लिए बेहद ज़रूरी)
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
     log_memory(label)
 
 
@@ -250,9 +258,8 @@ def extract_audio_url(video_url):
     log_memory("before extraction")
 
     options = {
-        # 96 kbps तक audio को प्राथमिकता दें; छोटे सर्वर पर अनावश्यक high-bitrate
-        # stream metadata/processing से बचें। उपलब्ध न हो तो अगला audio format लें।
-        "format": "bestaudio[abr<=96]/bestaudio/best",
+        # 64-96 kbps तक audio को प्राथमिकता ताकि छोटे सर्वर पर अनावश्यक संसाधन न लगें
+        "format": "bestaudio[abr<=64]/bestaudio/best",
         "format_sort": ["abr", "acodec:opus"],
 
         "quiet": True,
@@ -623,7 +630,6 @@ async def skip_music(chat_id):
 
         print(f"⏭️ SKIP TO: {next_song['title']}")
 
-        # अगला URL तैयार होने तक वर्तमान stream चलती रहेगी।
         audio_url = await get_audio_url_for_song(
             chat_id,
             next_song
@@ -1005,8 +1011,6 @@ async def main():
 
     print("🤖 Pandey Music Bot Starting...")
 
-    # Be polite to shared hosts. This lowers scheduling priority; it does NOT
-    # enforce a 25% CPU quota (that must be set in the hosting panel).
     try:
         os.nice(5)
     except (AttributeError, OSError):
@@ -1016,7 +1020,7 @@ async def main():
 
     QJS_PATH = find_quickjs()
 
-    print("⚡ LOW RAM MODE ENABLED")
+    print("⚡ LOW RAM MODE ENABLED (256MB Optimized)")
     print("🚫 Automatic Preload DISABLED")
     print("🧠 Single Extraction Enabled")
     print("🎧 LOW Audio Quality")
