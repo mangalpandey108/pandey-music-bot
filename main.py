@@ -267,6 +267,7 @@ def extract_audio_url(video_url):
 
     options = {
         "format": "best/bestaudio",
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
