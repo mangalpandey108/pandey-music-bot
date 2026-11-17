@@ -399,7 +399,6 @@ async def get_audio_url_for_song(chat_id, song):
 # ================= PLAYBACK =================
 
 async def start_song_in_call(chat_id, song, audio_url):
-    # PyTgCalls में सही ऑडियो क्वालिटी और ट्रांसमिशन पैरामीटर सेट करना ताकि वॉइस चैट में आवाज़ लगातार आए
     await calls.play(
         chat_id,
         MediaStream(
@@ -1150,24 +1149,3 @@ if __name__ == "__main__":
     while True:
         try:
             print("🔄 Starting Bot...")
-            asyncio.run(main())
-
-            print("⚠️ Bot stopped normally.")
-            break
-
-        except KeyboardInterrupt:
-            print("🛑 Manual shutdown.")
-            break
-
-        except Exception as error:
-            print(
-                f"💥 BOT ERROR: {type(error).__name__}: {error}"
-            )
-            traceback.print_exc()
-
-            print(
-                f"🔁 Restarting in "
-                f"{RESTART_DELAY_SECONDS} seconds..."
-            )
-
-            time.sleep(RESTART_DELAY_SECONDS)
