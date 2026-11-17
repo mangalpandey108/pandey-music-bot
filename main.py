@@ -52,7 +52,7 @@ API_ID = int(API_ID_TEXT)
 # Small-server safety: cap queued songs per chat to avoid unbounded RAM growth.
 MAX_QUEUE_SIZE = 20
 
-# एक समय में केवल एक extraction ताकि रैम पर एकसाथ लोड न पड़े
+# एक समय में केवल एक extraction ताकि रैम पर एकसाथ लोड न पड़े
 EXTRACTION_SEMAPHORE_LIMIT = 1
 
 
@@ -126,7 +126,7 @@ def log_memory(label):
 def cleanup_memory(label="cleanup"):
     gc.collect()
     try:
-        # पाइथन द्वारा रोकी गई फालतू रैम को सीधे ऑपरेटिंग सिस्टम को वापस लौटाना (256MB RAM के लिए बेहद ज़रूरी)
+        # पाइथन द्वारा रोकी गई फालतू रैम को सीधे ऑपरेटिंग सिस्टम को वापस लौटाना (256MB RAM के लिए बेहद ज़रूरी)
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
     except Exception:
@@ -257,11 +257,9 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
     log_memory("before extraction")
 
+    # फॉर्मेट से strict restrictions हटा दी गई हैं ताकि 'Requested format is not available' एरर न आए
     options = {
-        # 64-96 kbps तक audio को प्राथमिकता ताकि छोटे सर्वर पर अनावश्यक संसाधन न लगें
-        "format": "bestaudio[abr<=64]/bestaudio/best",
-        "format_sort": ["abr", "acodec:opus"],
-
+        "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
