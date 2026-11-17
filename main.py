@@ -45,6 +45,32 @@ if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
 
 API_ID = int(API_ID_TEXT)
 
+MAX_QUEUE_SIZE = 50
+
+# ================= GLOBALS =================
+
+bot = None
+user = None
+calls = None
+QJS_PATH = None
+
+queues = defaultdict(deque)
+current_songs = {}
+now_playing_messages = {}
+
+playback_starting = set()
+skip_in_progress = set()
+stop_in_progress = set()
+failed_chats = set()
+
+# एक समय में केवल एक yt-dlp extraction
+extraction_semaphore = None
+
+# Stop के बाद पुराने extraction को playback शुरू करने से रोकता है
+chat_generation = defaultdict(int)
+
+http = requests.Session()
+
 
 # ================= QUICKJS =================
 
@@ -64,42 +90,6 @@ def find_quickjs():
 
     print("⚠️ QuickJS नहीं मिला।")
     return None
-
-
-# ================= GLOBALS =================
-
-bot = None
-user = None
-calls = None
-
-QJS_PATH = None
-
-queues = defaultdict(deque)
-current_songs = {}
-now_playing_messages = {}
-
-playback_starting = set()
-skip_in_progress = set()
-stop_in_progress = set()
-failed_chats = set()
-
-# केवल एक global preload
-
-preloaded_audio = None
-preload_task = None
-preload_chat_id = None
-preload_extracting = False
-
-extraction_semaphore = None
-
-PRELOAD_DELAY_SECONDS = 30
-
-PRELOAD_MAX_MEMORY_RATIO = 0.35
-PRELOAD_MAX_MEMORY_MB = 105
-
-MAX_QUEUE_SIZE = 50
-
-http = requests.Session()
 
 
 # ================= MEMORY MONITOR =================
@@ -147,7 +137,6 @@ def memory_snapshot():
 
     try:
         for line in Path("/proc/self/status").read_text().splitlines():
-
             if line.startswith("VmRSS:"):
                 rss = int(line.split()[1]) / 1024
                 return rss, 256.0, "process-rss"
@@ -169,55 +158,26 @@ def log_memory(label):
         )
 
 
-def preload_memory_is_safe():
-
-    used, limit, source = memory_snapshot()
-
-    if used is None or limit is None:
-        print("⚠️ RAM information unavailable. Preload skipped.")
-        return False
-
-    ratio = used / limit
-
-    print(
-        f"🧠 Preload RAM: "
-        f"{used:.1f}/{limit:.1f} MB ({ratio:.0%})"
-    )
-
-    if used >= PRELOAD_MAX_MEMORY_MB:
-        return False
-
-    if ratio >= PRELOAD_MAX_MEMORY_RATIO:
-        return False
-
-    return True
-
-
 # ================= BUTTONS =================
 
 def music_buttons():
 
     return InlineKeyboardMarkup([
-
         [
             InlineKeyboardButton("▶️ Resume", callback_data="music:resume"),
             InlineKeyboardButton("⏸️ Pause", callback_data="music:pause")
         ],
-
         [
             InlineKeyboardButton("⏭️ Skip", callback_data="music:skip"),
             InlineKeyboardButton("⏹️ Stop", callback_data="music:stop")
         ],
-
         [
             InlineKeyboardButton("📋 Queue", callback_data="music:queue"),
             InlineKeyboardButton("🎵 Play", callback_data="music:play")
         ],
-
         [
             InlineKeyboardButton("🛑 End", callback_data="music:end")
         ]
-
     ])
 
 
@@ -308,12 +268,11 @@ def extract_audio_url(video_url):
     log_memory("before extraction")
 
     options = {
-        # पहले audio-only, उपलब्ध न हो तो best format
-        "format": "bestaudio/best",
+        # कम bitrate वाला audio पहले चुनेगा
+        "format": "worstaudio/best",
 
         "quiet": True,
         "no_warnings": True,
-
         "noplaylist": True,
         "skip_download": True,
 
@@ -358,7 +317,9 @@ def extract_audio_url(video_url):
 
         if candidate.is_file():
             runtime_path = str(candidate)
-            runtime_name = "quickjs" if candidate.name == "qjs" else "custom"
+            runtime_name = (
+                "quickjs" if candidate.name == "qjs" else "custom"
+            )
 
     if runtime_path and runtime_name:
         options["js_runtimes"] = {
@@ -371,8 +332,6 @@ def extract_audio_url(video_url):
 
     else:
         print("⚠️ JS runtime unavailable.")
-
-    info = None
 
     try:
 
@@ -387,7 +346,6 @@ def extract_audio_url(video_url):
         if not audio_url:
 
             formats = info.get("formats") or []
-
             best_format = None
             best_score = (-1, -1)
 
@@ -435,170 +393,15 @@ def extract_audio_url(video_url):
         ) from error
 
     finally:
-        info = None
         log_memory("after extraction")
 
 
-# ================= SMART PRELOAD =================
-
-async def _preload_next_song(chat_id, song):
-
-    global preload_task
-    global preload_chat_id
-    global preload_extracting
-    global preloaded_audio
-
-    this_task = asyncio.current_task()
-
-    try:
-
-        await asyncio.sleep(PRELOAD_DELAY_SECONDS)
-
-        if not preload_memory_is_safe():
-            print("⚠️ RAM कम है। Preload skipped.")
-            return
-
-        if (
-            chat_id in stop_in_progress
-            or chat_id not in current_songs
-            or not queues[chat_id]
-            or queues[chat_id][0] is not song
-            or preloaded_audio is not None
-        ):
-            return
-
-        async with extraction_semaphore:
-
-            if chat_id in stop_in_progress:
-                return
-
-            preload_extracting = True
-
-            audio_url = await asyncio.to_thread(
-                extract_audio_url,
-                song["url"]
-            )
-
-        song_is_next = (
-            bool(queues[chat_id])
-            and queues[chat_id][0] is song
-        )
-
-        song_is_starting = (
-            chat_id in playback_starting
-            or chat_id in skip_in_progress
-        )
-
-        if (
-            chat_id not in stop_in_progress
-            and chat_id in current_songs
-            and (song_is_next or song_is_starting)
-            and preloaded_audio is None
-        ):
-
-            preloaded_audio = (chat_id, song, audio_url)
-
-            print(f"⚡ PRELOAD READY: {song.get('title')}")
-
-        else:
-            print("ℹ️ Old preload discarded.")
-
-    except asyncio.CancelledError:
-        raise
-
-    except Exception as error:
-        print(
-            f"⚠️ PRELOAD ERROR: "
-            f"{type(error).__name__}: {error}"
-        )
-
-    finally:
-
-        if preload_task is this_task:
-            preload_task = None
-            preload_chat_id = None
-            preload_extracting = False
-
-
-def schedule_preload(chat_id):
-
-    global preload_task
-    global preload_chat_id
-
-    if chat_id in stop_in_progress:
-        return
-
-    if chat_id not in current_songs:
-        return
-
-    if not queues[chat_id] or preloaded_audio is not None:
-        return
-
-    if preload_task is not None and not preload_task.done():
-        return
-
-    song = queues[chat_id][0]
-    preload_chat_id = chat_id
-
-    preload_task = asyncio.create_task(
-        _preload_next_song(chat_id, song)
-    )
-
-    print(f"⏳ Preload scheduled: {PRELOAD_DELAY_SECONDS}s")
-
+# ================= AUDIO URL =================
 
 async def get_audio_url_for_song(chat_id, song):
 
-    global preloaded_audio
-    global preload_task
-
-    if (
-        preloaded_audio is not None
-        and preloaded_audio[0] == chat_id
-        and preloaded_audio[1] is song
-    ):
-
-        audio_url = preloaded_audio[2]
-        preloaded_audio = None
-
-        return audio_url
-
-    task = preload_task
-
-    if (
-        task is not None
-        and not task.done()
-        and preload_chat_id == chat_id
-    ):
-
-        if not preload_extracting:
-
-            task.cancel()
-
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        else:
-
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        if (
-            preloaded_audio is not None
-            and preloaded_audio[0] == chat_id
-            and preloaded_audio[1] is song
-        ):
-
-            audio_url = preloaded_audio[2]
-            preloaded_audio = None
-
-            return audio_url
-
     async with extraction_semaphore:
+
         return await asyncio.to_thread(
             extract_audio_url,
             song["url"]
@@ -641,7 +444,9 @@ async def play_next(chat_id):
         return False
 
     playback_starting.add(chat_id)
+
     song = queues[chat_id].popleft()
+    generation = chat_generation[chat_id]
 
     try:
 
@@ -651,11 +456,17 @@ async def play_next(chat_id):
 
         audio_url = await get_audio_url_for_song(chat_id, song)
 
+        # Stop या End के बाद पुराने गाने को शुरू न करें
+        if (
+            chat_id in stop_in_progress
+            or generation != chat_generation[chat_id]
+        ):
+            print("ℹ️ Old extraction discarded.")
+            return False
+
         vc_started = time.perf_counter()
 
         await start_song_in_call(chat_id, song, audio_url)
-
-        schedule_preload(chat_id)
 
         print(
             f"📡 VC Switch: "
@@ -768,10 +579,8 @@ async def stream_ended_handler(_, update: StreamEnded):
 
 async def stop_music(chat_id):
 
-    global preloaded_audio
-    global preload_task
-
     stop_in_progress.add(chat_id)
+    chat_generation[chat_id] += 1
 
     try:
 
@@ -779,26 +588,6 @@ async def stop_music(chat_id):
         current_songs.pop(chat_id, None)
         failed_chats.discard(chat_id)
         now_playing_messages.pop(chat_id, None)
-
-        if (
-            preloaded_audio is not None
-            and preloaded_audio[0] == chat_id
-        ):
-            preloaded_audio = None
-
-        if (
-            preload_task is not None
-            and not preload_task.done()
-            and preload_chat_id == chat_id
-            and not preload_extracting
-        ):
-
-            preload_task.cancel()
-
-            try:
-                await preload_task
-            except asyncio.CancelledError:
-                pass
 
         await calls.leave_call(chat_id)
 
@@ -823,6 +612,8 @@ async def skip_music(chat_id):
 
     skip_in_progress.add(chat_id)
 
+    generation = chat_generation[chat_id]
+
     try:
 
         if not queues[chat_id]:
@@ -846,13 +637,18 @@ async def skip_music(chat_id):
             next_song
         )
 
+        if (
+            chat_id in stop_in_progress
+            or generation != chat_generation[chat_id]
+        ):
+            print("ℹ️ Skip extraction discarded.")
+            return False
+
         await start_song_in_call(
             chat_id,
             next_song,
             audio_url
         )
-
-        schedule_preload(chat_id)
 
         print(f"✅ SKIP COMPLETE: {chat_id}")
 
@@ -1085,8 +881,6 @@ async def play_command(client, message):
             or chat_id in skip_in_progress
         ):
 
-            schedule_preload(chat_id)
-
             await status.edit_text(
                 f"✅ Queue में जोड़ा गया:\n"
                 f"{song['title']}\n"
@@ -1271,13 +1065,13 @@ async def main():
 
     log_memory("startup")
 
-    # केवल पहले से मौजूद QuickJS खोजें; डाउनलोड नहीं होगा
     QJS_PATH = find_quickjs()
 
-    print("⚠️ LOW RAM MODE ENABLED")
-    print("⚡ Single Global Preload")
-    print("🧠 Single Extraction")
-    print("🎧 Audio Quality LOW")
+    print("⚡ LOW RAM MODE ENABLED")
+    print("🚫 Automatic Preload DISABLED")
+    print("🧠 Single Extraction Enabled")
+    print("🎧 Low Bitrate Audio Preferred")
+    print("👷 Pyrogram Workers: 1")
 
     bot = Client(
         "PandeyMusicBot",
@@ -1288,7 +1082,7 @@ async def main():
         max_concurrent_transmissions=1
     )
 
-    # PyTgCalls voice chat के लिए normal Telegram user session जरूरी है
+    # PyTgCalls के लिए normal Telegram user session जरूरी है
     user = Client(
         "FreshLogin",
         api_id=API_ID,
@@ -1356,8 +1150,8 @@ async def main():
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot ONLINE")
         print("🍪 YouTube Cookies Enabled")
-        print("⚡ Smart Preload Enabled")
-        print("🧠 RAM Protection Enabled")
+        print("🚫 Preload Disabled")
+        print("🧠 Single Extraction Enabled")
 
         log_memory("online")
 
@@ -1392,6 +1186,11 @@ async def main():
         try:
             if bot and bot.is_connected:
                 await bot.stop()
+        except Exception:
+            pass
+
+        try:
+            http.close()
         except Exception:
             pass
 
