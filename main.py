@@ -272,15 +272,13 @@ def extract_audio_url(video_url):
         "noplaylist": True,
         "skip_download": True,
 
-        "socket_timeout": 12,
-        "retries": 0,
-        "extractor_retries": 0,
-        "fragment_retries": 0,
+        "socket_timeout": 15,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
 
         "cachedir": False,
         "noprogress": True,
-        "concurrent_fragment_downloads": 1,
-
         "ignoreerrors": False,
         "logtostderr": False,
     }
@@ -333,34 +331,24 @@ def extract_audio_url(video_url):
         if not info:
             raise RuntimeError("YouTube information नहीं मिली।")
 
+        # सीधे डायरेक्ट ऑडियो URL प्राप्त करें
         audio_url = info.get("url")
 
-        if not audio_url:
-            formats = info.get("formats") or []
+        if not audio_url and "requested_formats" in info:
+            req_formats = info.get("requested_formats")
+            if req_formats:
+                audio_url = req_formats[0].get("url")
 
-            audio_formats = [
-                item for item in formats
-                if item.get("url")
-                and item.get("acodec") not in (None, "none")
-            ]
-
-            audio_only = [
-                item for item in audio_formats
-                if item.get("vcodec") in (None, "none")
-            ]
-
-            candidates = audio_only or audio_formats
-
-            candidates.sort(
-                key=lambda item: (
-                    item.get("abr")
-                    or item.get("tbr")
-                    or 9999
-                )
-            )
-
-            if candidates:
-                audio_url = candidates[0].get("url")
+        if not audio_url and "formats" in info:
+            for f in info.get("formats", []):
+                if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                    audio_url = f.get("url")
+                    break
+            if not audio_url:
+                for f in info.get("formats", []):
+                    if f.get("url"):
+                        audio_url = f.get("url")
+                        break
 
         if not audio_url:
             raise RuntimeError("Audio URL नहीं मिली।")
@@ -380,25 +368,17 @@ def extract_audio_url(video_url):
                 "YouTube verification माँग रहा है। Cookies जाँचें।"
             ) from error
 
-        if "requested format is not available" in error_text.casefold():
-            raise RuntimeError(
-                "YouTube ने उपलब्ध audio format नहीं दिया। "
-                "yt-dlp और JS runtime जाँचें।"
-            ) from error
-
         raise RuntimeError(
             f"yt-dlp failed: {error_text[:400]}"
         ) from error
 
     finally:
         info = None
-
         if ydl is not None:
             try:
                 ydl.close()
             except Exception:
                 pass
-
         ydl = None
         cleanup_memory("after extraction")
 
@@ -1181,5 +1161,4 @@ if __name__ == "__main__":
                 f"{RESTART_DELAY_SECONDS} seconds..."
             )
 
-            time.time() # fallback
             time.sleep(RESTART_DELAY_SECONDS)
