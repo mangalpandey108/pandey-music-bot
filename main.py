@@ -1,4 +1,11 @@
 import os
+
+# Keep native libraries from creating extra worker threads on small hosts.
+os.environ.setdefault('MALLOC_ARENA_MAX', '2')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+
 import gc
 import asyncio
 import traceback
@@ -41,8 +48,8 @@ if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
 
 API_ID = int(API_ID_TEXT)
 
-# Unlimited Queue
-MAX_QUEUE_SIZE = None
+# Small-server safety: cap queued songs per chat to avoid unbounded RAM growth.
+MAX_QUEUE_SIZE = 20
 
 # एक समय में केवल एक extraction
 EXTRACTION_SEMAPHORE_LIMIT = 1
@@ -67,6 +74,10 @@ failed_chats = set()
 chat_generation = defaultdict(int)
 
 http = requests.Session()
+# Keep the HTTP connection pool small; only one YouTube API search runs at a time.
+http.mount('https://', requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1))
+# More frequent cyclic collection helps long-running low-memory containers.
+gc.set_threshold(200, 5, 5)
 
 
 # ================= MEMORY =================
@@ -211,9 +222,11 @@ def search_youtube(query):
         timeout=(5, 10)
     )
 
-    response.raise_for_status()
-
-    items = response.json().get("items", [])
+    try:
+        response.raise_for_status()
+        items = response.json().get("items", [])
+    finally:
+        response.close()
 
     print(f"🔎 YouTube Search: {time.perf_counter() - started:.2f}s")
 
@@ -237,8 +250,10 @@ def extract_audio_url(video_url):
     log_memory("before extraction")
 
     options = {
-        # बदला हुआ format: पहले abr<=96 की पाबंदी हटाई गई है।
-        "format": "bestaudio/best",
+        # 96 kbps तक audio को प्राथमिकता दें; छोटे सर्वर पर अनावश्यक high-bitrate
+        # stream metadata/processing से बचें। उपलब्ध न हो तो अगला audio format लें।
+        "format": "bestaudio[abr<=96]/bestaudio/best",
+        "format_sort": ["abr", "acodec:opus"],
 
         "quiet": True,
         "no_warnings": True,
@@ -990,6 +1005,13 @@ async def main():
 
     print("🤖 Pandey Music Bot Starting...")
 
+    # Be polite to shared hosts. This lowers scheduling priority; it does NOT
+    # enforce a 25% CPU quota (that must be set in the hosting panel).
+    try:
+        os.nice(5)
+    except (AttributeError, OSError):
+        pass
+
     log_memory("startup")
 
     QJS_PATH = find_quickjs()
@@ -998,7 +1020,7 @@ async def main():
     print("🚫 Automatic Preload DISABLED")
     print("🧠 Single Extraction Enabled")
     print("🎧 LOW Audio Quality")
-    print("📋 Queue: Unlimited")
+    print(f"📋 Queue: Maximum {MAX_QUEUE_SIZE} songs per chat")
     print("👷 Pyrogram Workers: 1")
 
     bot = Client(
