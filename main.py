@@ -266,7 +266,7 @@ def extract_audio_url(video_url):
     log_memory("before extraction")
 
     options = {
-        "format": "bestaudio/best",
+        "format": "best/bestaudio",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -331,7 +331,6 @@ def extract_audio_url(video_url):
         if not info:
             raise RuntimeError("YouTube information नहीं मिली।")
 
-        # सीधे डायरेक्ट ऑडियो URL प्राप्त करें
         audio_url = info.get("url")
 
         if not audio_url and "requested_formats" in info:
