@@ -46,6 +46,10 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+YOUTUBE_COOKIES_FILE = os.getenv(
+    "YOUTUBE_COOKIES_FILE", "/home/container/cookies.txt"
+).strip()
+
 YOUTUBE_JS_RUNTIME = os.getenv("YOUTUBE_JS_RUNTIME", "auto").strip().lower()
 
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
@@ -261,9 +265,8 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
     log_memory("before extraction")
 
-    # कुकीज़ पूरी तरह से हटा दी गई हैं और एंड्रॉइड क्लाइंट का उपयोग किया गया है
     options = {
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -280,7 +283,11 @@ def extract_audio_url(video_url):
         "logtostderr": False,
     }
 
-    print("🚀 Running in Cookie-free Android Client Mode.")
+    if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
+        options["cookiefile"] = YOUTUBE_COOKIES_FILE
+        print("🍪 YouTube cookies enabled.")
+    else:
+        print("⚠️ चेतावनी: cookies.txt फाइल नहीं मिली, YouTube बॉट वेरिफिकेशन रोक सकता है!")
 
     runtime_path = None
     runtime_name = None
@@ -994,7 +1001,7 @@ async def main():
     QJS_PATH = find_quickjs()
 
     print("⚡ LOW RAM MODE ENABLED (256MB Optimized)")
-    print("🚫 Cookie-free Android Client Mode Enabled")
+    print("🍪 YouTube Cookies Authenticated Mode Enabled")
     print("🧠 Single Extraction Enabled")
     print("🎧 LOW Audio Quality")
     print(f"📋 Queue: Maximum {MAX_QUEUE_SIZE} songs per chat")
@@ -1073,6 +1080,11 @@ async def main():
 
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot ONLINE")
+
+        if Path(YOUTUBE_COOKIES_FILE).is_file():
+            print("🍪 YouTube Cookies Enabled")
+        else:
+            print("⚠️ YouTube cookies.txt not found")
 
         log_memory("online")
 
