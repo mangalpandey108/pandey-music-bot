@@ -265,7 +265,9 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
     log_memory("before extraction")
 
+    # यहाँ format को "best/bestaudio" पर सेट किया गया है ताकि Requested format is not available की एरर न आए
     options = {
+        "format": "best/bestaudio",
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "quiet": True,
         "no_warnings": True,
@@ -287,7 +289,7 @@ def extract_audio_url(video_url):
         options["cookiefile"] = YOUTUBE_COOKIES_FILE
         print("🍪 YouTube cookies enabled.")
     else:
-        print("⚠️ चेतावनी: cookies.txt फाइल नहीं मिली, YouTube बॉट वेरिफिकेशन रोक सकता है!")
+        print("⚠️ चेतावनी: cookies.txt फाइल नहीं मिली!")
 
     runtime_path = None
     runtime_name = None
