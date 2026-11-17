@@ -266,7 +266,7 @@ def extract_audio_url(video_url):
     log_memory("before extraction")
 
     options = {
-        "format": "all",
+        "format": "bestaudio/best",
         "extractor_args": {"youtube": {"player_client": ["android", "web", "mweb"]}},
         "quiet": True,
         "no_warnings": True,
@@ -339,7 +339,7 @@ def extract_audio_url(video_url):
 
         if not audio_url and "requested_formats" in info:
             for fmt in info.get("requested_formats", []):
-                if fmt.get("url"):
+                if fmt.get("url") and fmt.get("acodec") != "none":
                     audio_url = fmt.get("url")
                     break
 
@@ -399,10 +399,13 @@ async def get_audio_url_for_song(chat_id, song):
 # ================= PLAYBACK =================
 
 async def start_song_in_call(chat_id, song, audio_url):
-    # PyTgCalls में स्ट्रीम बिना क्वालिटी बाउंड्री के सीधे प्ले की जा रही है ताकि STREAM ENDED एरर न आए
+    # PyTgCalls में सही ऑडियो क्वालिटी और ट्रांसमिशन पैरामीटर सेट करना ताकि वॉइस चैट में आवाज़ लगातार आए
     await calls.play(
         chat_id,
-        MediaStream(audio_url)
+        MediaStream(
+            audio_url,
+            audio_parameters=AudioQuality.LOW
+        )
     )
 
     current_songs[chat_id] = song
