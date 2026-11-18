@@ -6,15 +6,7 @@ os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 
-# बॉट शुरू होने से पहले yt-dlp को ऑटोमैटिकली लेटेस्ट वर्जन पर अपडेट करने का प्रयास
-try:
-    import subprocess
-    print("🔄 Checking & Upgrading yt-dlp automatically...")
-    subprocess.run(["pip", "install", "--upgrade", "--user", "yt-dlp"], check=False, capture_output=True)
-except Exception:
-    pass
-
-import gc
+# yt-dlp को deployment में अलग से update करें; startup पर pip install न चलाएँ।\n\nimport gc
 import asyncio
 import traceback
 import time
@@ -265,28 +257,26 @@ def extract_audio_url(video_url):
     started = time.perf_counter()
     log_memory("before extraction")
 
-    # यहाँ format को "best/bestaudio" पर सेट किया गया है ताकि Requested format is not available की एरर न आए
-    options = {
-        "format": "best/bestaudio",
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    # Prefer an audio-only stream; fall back to the best playable format.
+    # Do not force YouTube player clients: yt-dlp's defaults are usually
+    # more compatible with the current YouTube response.
+    base_options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-
         "socket_timeout": 15,
-        "retries": 3,
-        "extractor_retries": 3,
-        "fragment_retries": 3,
-
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
         "cachedir": False,
         "noprogress": True,
-        "ignoreerrors": True,
+        "ignoreerrors": False,
         "logtostderr": False,
     }
 
     if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
-        options["cookiefile"] = YOUTUBE_COOKIES_FILE
+        base_options["cookiefile"] = YOUTUBE_COOKIES_FILE
         print("🍪 YouTube cookies enabled.")
     else:
         print("⚠️ चेतावनी: cookies.txt फाइल नहीं मिली!")
@@ -298,17 +288,14 @@ def extract_audio_url(video_url):
         runtime_path = QJS_PATH
         if runtime_path:
             runtime_name = "quickjs"
-
     elif YOUTUBE_JS_RUNTIME in ("quickjs", "qjs"):
         runtime_path = QJS_PATH or shutil.which("qjs")
         if runtime_path:
             runtime_name = "quickjs"
-
     elif YOUTUBE_JS_RUNTIME == "node":
         runtime_path = shutil.which("node")
         if runtime_path:
             runtime_name = "node"
-
     elif YOUTUBE_JS_RUNTIME not in ("", "none", "false", "0"):
         candidate = Path(YOUTUBE_JS_RUNTIME)
         if candidate.is_file():
@@ -316,71 +303,95 @@ def extract_audio_url(video_url):
             runtime_name = "quickjs" if candidate.name == "qjs" else "node"
 
     if runtime_path and runtime_name:
-        options["js_runtimes"] = {
+        base_options["js_runtimes"] = {
             runtime_name: {"path": runtime_path}
         }
         print(f"✅ yt-dlp JS runtime: {runtime_path}")
     else:
         print("⚠️ JS runtime unavailable.")
 
-    ydl = None
-    info = None
+    last_error = None
 
-    try:
-        ydl = yt_dlp.YoutubeDL(options)
-        info = ydl.extract_info(video_url, download=False)
+    # Retry once with a broader format selector if YouTube has no
+    # audio-only format for this video/client response.
+    for attempt, format_selector in enumerate(
+        ("bestaudio/best", "best"), start=1
+    ):
+        ydl = None
+        info = None
+        try:
+            options = dict(base_options)
+            options["format"] = format_selector
 
-        if not info:
-            raise RuntimeError("YouTube information नहीं मिली।")
+            ydl = yt_dlp.YoutubeDL(options)
+            info = ydl.extract_info(video_url, download=False)
 
-        audio_url = None
+            if not info:
+                raise RuntimeError("YouTube information नहीं मिली।")
 
-        if "url" in info and info["url"]:
-            audio_url = info["url"]
+            audio_url = None
 
-        if not audio_url and "requested_formats" in info:
-            for fmt in info.get("requested_formats", []):
-                if fmt.get("url") and fmt.get("acodec") != "none":
-                    audio_url = fmt.get("url")
-                    break
+            # Direct URL is valid only if the selected format has audio.
+            if info.get("url") and info.get("acodec") != "none":
+                audio_url = info["url"]
 
-        if not audio_url and "formats" in info:
-            formats = info.get("formats", [])
-            for f in formats:
-                if f.get("url") and f.get("acodec") != "none" and f.get("vcodec") == "none":
-                    audio_url = f.get("url")
-                    break
+            # Some extractors return separate requested formats.
             if not audio_url:
-                for f in formats:
-                    if f.get("url"):
-                        audio_url = f.get("url")
+                for fmt in info.get("requested_formats", []):
+                    if fmt.get("url") and fmt.get("acodec") != "none":
+                        audio_url = fmt["url"]
                         break
 
-        if not audio_url:
-            raise RuntimeError("YouTube ने कोई भी playable audio stream नहीं दिया।")
+            # Prefer audio-only formats, then any format containing audio.
+            formats = info.get("formats", [])
+            if not audio_url:
+                for fmt in formats:
+                    if (
+                        fmt.get("url")
+                        and fmt.get("acodec") != "none"
+                        and fmt.get("vcodec") == "none"
+                    ):
+                        audio_url = fmt["url"]
+                        break
 
-        print(
-            f"⚡ Extraction Time: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
+            if not audio_url:
+                for fmt in formats:
+                    if fmt.get("url") and fmt.get("acodec") != "none":
+                        audio_url = fmt["url"]
+                        break
 
-        return audio_url
+            if not audio_url:
+                raise RuntimeError(
+                    "YouTube ने कोई playable audio stream नहीं दिया।"
+                )
 
-    except Exception as error:
-        error_text = str(error)
-        raise RuntimeError(
-            f"yt-dlp extraction failed: {error_text[:300]}"
-        ) from error
+            print(
+                f"⚡ Extraction Time: "
+                f"{time.perf_counter() - started:.2f}s "
+                f"(format attempt {attempt})"
+            )
+            return audio_url
 
-    finally:
-        info = None
-        if ydl is not None:
-            try:
-                ydl.close()
-            except Exception:
-                pass
-        ydl = None
-        cleanup_memory("after extraction")
+        except Exception as error:
+            last_error = error
+            print(
+                f"⚠️ yt-dlp attempt {attempt} failed "
+                f"({format_selector}): {str(error)[:200]}"
+            )
+
+        finally:
+            info = None
+            if ydl is not None:
+                try:
+                    ydl.close()
+                except Exception:
+                    pass
+            ydl = None
+            cleanup_memory(f"after extraction attempt {attempt}")
+
+    raise RuntimeError(
+        f"yt-dlp extraction failed: {str(last_error)[:300]}"
+    ) from last_error
 
 
 async def get_audio_url_for_song(chat_id, song):
