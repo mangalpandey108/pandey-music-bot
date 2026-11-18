@@ -256,32 +256,35 @@ def search_youtube(query):
 # ================= AUDIO EXTRACTION =================
 
 def extract_audio_url(video_url):
+    """
+    Extract a direct audio-capable URL without downloading/transcoding.
+    Format fallbacks cannot bypass YouTube authentication or IP restrictions.
+    """
     started = time.perf_counter()
     log_memory("before extraction")
 
-    # Prefer an audio-only stream; fall back to the best playable format.
-    # Do not force YouTube player clients: yt-dlp's defaults are usually
-    # more compatible with the current YouTube response.
     base_options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 15,
-        "retries": 2,
-        "extractor_retries": 2,
-        "fragment_retries": 2,
+        "socket_timeout": 12,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
         "cachedir": False,
         "noprogress": True,
         "ignoreerrors": False,
         "logtostderr": False,
+        "geo_bypass": True,
+        "check_formats": False,
     }
 
     if YOUTUBE_COOKIES_FILE and Path(YOUTUBE_COOKIES_FILE).is_file():
         base_options["cookiefile"] = YOUTUBE_COOKIES_FILE
         print("🍪 YouTube cookies enabled.")
     else:
-        print("⚠️ चेतावनी: cookies.txt फाइल नहीं मिली!")
+        print("⚠️ cookies.txt नहीं मिली; कुछ YouTube वीडियो उपलब्ध नहीं होंगे।")
 
     runtime_path = None
     runtime_name = None
@@ -305,81 +308,95 @@ def extract_audio_url(video_url):
             runtime_name = "quickjs" if candidate.name == "qjs" else "node"
 
     if runtime_path and runtime_name:
-        base_options["js_runtimes"] = {
-            runtime_name: {"path": runtime_path}
-        }
+        base_options["js_runtimes"] = {runtime_name: {"path": runtime_path}}
         print(f"✅ yt-dlp JS runtime: {runtime_path}")
     else:
-        print("⚠️ JS runtime unavailable.")
+        print("⚠️ yt-dlp JS runtime उपलब्ध नहीं है।")
+
+    # Audio-only first, then any format that contains an audio codec.
+    format_selectors = (
+        "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[acodec!=none]/best",
+        "bestaudio/best[acodec!=none]/best",
+        "best[acodec!=none]/best",
+    )
 
     last_error = None
-
-    # Retry once with a broader format selector if YouTube has no
-    # audio-only format for this video/client response.
-    for attempt, format_selector in enumerate(
-        ("bestaudio/best", "best"), start=1
-    ):
+    for attempt, format_selector in enumerate(format_selectors, start=1):
         ydl = None
         info = None
         try:
             options = dict(base_options)
             options["format"] = format_selector
-
             ydl = yt_dlp.YoutubeDL(options)
             info = ydl.extract_info(video_url, download=False)
 
             if not info:
-                raise RuntimeError("YouTube information नहीं मिली।")
+                raise RuntimeError("YouTube से वीडियो की जानकारी नहीं मिली।")
 
-            audio_url = None
+            candidates = []
+            if info.get("url") and info.get("acodec") not in (None, "none"):
+                candidates.append(info)
 
-            # Direct URL is valid only if the selected format has audio.
-            if info.get("url") and info.get("acodec") != "none":
-                audio_url = info["url"]
+            for fmt in info.get("requested_formats") or []:
+                if fmt.get("url") and fmt.get("acodec") not in (None, "none"):
+                    candidates.append(fmt)
 
-            # Some extractors return separate requested formats.
+            formats = info.get("formats") or []
+            audio_only = [
+                fmt for fmt in formats
+                if fmt.get("url")
+                and fmt.get("acodec") not in (None, "none")
+                and fmt.get("vcodec") == "none"
+            ]
+            audio_only.sort(
+                key=lambda fmt: (
+                    fmt.get("abr") or 0,
+                    fmt.get("tbr") or 0,
+                    1 if fmt.get("ext") == "m4a" else 0,
+                ),
+                reverse=True,
+            )
+            candidates.extend(audio_only)
+
+            combined = [
+                fmt for fmt in formats
+                if fmt.get("url")
+                and fmt.get("acodec") not in (None, "none")
+            ]
+            combined.sort(
+                key=lambda fmt: (fmt.get("abr") or 0, fmt.get("tbr") or 0),
+                reverse=True,
+            )
+            candidates.extend(combined)
+
+            audio_url = next(
+                (fmt.get("url") for fmt in candidates if fmt.get("url")),
+                None,
+            )
             if not audio_url:
-                for fmt in info.get("requested_formats", []):
-                    if fmt.get("url") and fmt.get("acodec") != "none":
-                        audio_url = fmt["url"]
-                        break
-
-            # Prefer audio-only formats, then any format containing audio.
-            formats = info.get("formats", [])
-            if not audio_url:
-                for fmt in formats:
-                    if (
-                        fmt.get("url")
-                        and fmt.get("acodec") != "none"
-                        and fmt.get("vcodec") == "none"
-                    ):
-                        audio_url = fmt["url"]
-                        break
-
-            if not audio_url:
-                for fmt in formats:
-                    if fmt.get("url") and fmt.get("acodec") != "none":
-                        audio_url = fmt["url"]
-                        break
-
-            if not audio_url:
-                raise RuntimeError(
-                    "YouTube ने कोई playable audio stream नहीं दिया।"
-                )
+                raise RuntimeError("कोई audio वाला playable format उपलब्ध नहीं है।")
 
             print(
-                f"⚡ Extraction Time: "
-                f"{time.perf_counter() - started:.2f}s "
-                f"(format attempt {attempt})"
+                f"⚡ Extraction सफल: {time.perf_counter() - started:.2f}s "
+                f"(fallback {attempt})"
             )
             return audio_url
 
         except Exception as error:
             last_error = error
+            error_text = str(error)
             print(
-                f"⚠️ yt-dlp attempt {attempt} failed "
-                f"({format_selector}): {str(error)[:200]}"
+                f"⚠️ Extraction fallback {attempt}/{len(format_selectors)} "
+                f"failed: {error_text[:220]}"
             )
+
+            lowered = error_text.lower()
+            if any(term in lowered for term in (
+                "sign in to confirm", "not a bot", "http error 429",
+                "video unavailable", "private video",
+            )):
+                # Format changes cannot solve authentication/rate-limit restrictions.
+                break
 
         finally:
             info = None
@@ -389,7 +406,7 @@ def extract_audio_url(video_url):
                 except Exception:
                     pass
             ydl = None
-            cleanup_memory(f"after extraction attempt {attempt}")
+            cleanup_memory(f"after extraction fallback {attempt}")
 
     raise RuntimeError(
         f"yt-dlp extraction failed: {str(last_error)[:300]}"
@@ -429,65 +446,65 @@ async def start_song_in_call(chat_id, song, audio_url):
 async def play_next(chat_id):
     if chat_id in playback_starting or chat_id in stop_in_progress:
         return False
-
     if not queues[chat_id]:
         return False
 
     playback_starting.add(chat_id)
-
-    song = queues[chat_id].popleft()
     generation = chat_generation[chat_id]
+    last_error = None
 
     try:
-        started = time.perf_counter()
+        # A failed/unavailable video is skipped; the next queued song is tried.
+        while queues[chat_id]:
+            if chat_id in stop_in_progress or generation != chat_generation[chat_id]:
+                return False
 
-        print(f"🎧 Trying: {song['title']}")
+            song = queues[chat_id].popleft()
+            started = time.perf_counter()
+            print(f"🎧 Trying: {song.get('title', 'Unknown Song')}")
 
-        audio_url = await get_audio_url_for_song(chat_id, song)
+            try:
+                audio_url = await get_audio_url_for_song(chat_id, song)
+                if (
+                    chat_id in stop_in_progress
+                    or generation != chat_generation[chat_id]
+                ):
+                    print("ℹ️ Old extraction discarded.")
+                    return False
 
-        if (
-            chat_id in stop_in_progress
-            or generation != chat_generation[chat_id]
-        ):
-            print("ℹ️ Old extraction discarded.")
-            return False
+                vc_started = time.perf_counter()
+                await start_song_in_call(chat_id, song, audio_url)
+                print(f"📡 VC start call: {time.perf_counter() - vc_started:.2f}s")
+                print(f"🎵 Total start: {time.perf_counter() - started:.2f}s")
+                return True
 
-        vc_started = time.perf_counter()
+            except Exception as error:
+                last_error = error
+                current_songs.pop(chat_id, None)
+                print(f"❌ Song failed: {song.get('title', 'Unknown Song')}")
+                print(f"Error: {error}")
+                traceback.print_exc()
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        "⚠️ यह गाना उपलब्ध नहीं हो पाया, Queue का अगला गाना "
+                        "चलाने की कोशिश कर रहा हूँ।\n"
+                        f"{song.get('title', 'Unknown Song')}",
+                    )
+                except Exception:
+                    pass
+                cleanup_memory("failed-song-recovery")
 
-        await start_song_in_call(chat_id, song, audio_url)
-
-        print(
-            f"📡 VC Switch: "
-            f"{time.perf_counter() - vc_started:.2f}s"
-        )
-
-        print(
-            f"🎵 Total Start: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
-
-        return True
-
-    except Exception as error:
-        current_songs.pop(chat_id, None)
         failed_chats.add(chat_id)
-
-        print(f"❌ Song Failed: {song.get('title')}")
-        print(f"Error: {error}")
-        traceback.print_exc()
-
-        try:
-            message_text = (
-                "❌ यह गाना शुरू नहीं हो पाया:\n"
-                f"{song.get('title', 'Unknown')}\n\n"
-                f"कारण: {str(error)[:250]}"
-            )
-
-            await bot.send_message(chat_id, message_text)
-
-        except Exception:
-            pass
-
+        if last_error:
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "❌ Queue के गाने उपलब्ध नहीं हो पाए। "
+                    "YouTube Cookies, JS Runtime और yt-dlp logs जाँचें।",
+                )
+            except Exception:
+                pass
         return False
 
     finally:
@@ -595,7 +612,6 @@ async def stop_music(chat_id):
 async def skip_music(chat_id):
     if chat_id in skip_in_progress or chat_id in stop_in_progress:
         return False
-
     if chat_id not in current_songs:
         return False
 
@@ -605,60 +621,55 @@ async def skip_music(chat_id):
     try:
         if not queues[chat_id]:
             current_songs.pop(chat_id, None)
-
             old_message = now_playing_messages.pop(chat_id, None)
-
             if old_message:
                 try:
                     await old_message.delete()
                 except Exception:
                     pass
-
             try:
                 await calls.pause_stream(chat_id)
             except Exception:
                 pass
-
             return True
 
-        next_song = queues[chat_id].popleft()
+        last_error = None
+        while queues[chat_id]:
+            if chat_id in stop_in_progress or generation != chat_generation[chat_id]:
+                return False
 
-        print(f"⏭️ SKIP TO: {next_song['title']}")
+            next_song = queues[chat_id].popleft()
+            print(f"⏭️ SKIP TO: {next_song.get('title', 'Unknown Song')}")
+            try:
+                audio_url = await get_audio_url_for_song(chat_id, next_song)
+                if (
+                    chat_id in stop_in_progress
+                    or generation != chat_generation[chat_id]
+                ):
+                    print("ℹ️ Skip extraction discarded.")
+                    return False
 
-        audio_url = await get_audio_url_for_song(
-            chat_id,
-            next_song
-        )
+                # PyTgCalls play replaces the current stream in this chat.
+                await start_song_in_call(chat_id, next_song, audio_url)
+                print(f"✅ SKIP COMPLETE: {chat_id}")
+                return True
 
-        if (
-            chat_id in stop_in_progress
-            or generation != chat_generation[chat_id]
-        ):
-            print("ℹ️ Skip extraction discarded.")
-            return False
+            except Exception as error:
+                last_error = error
+                print(f"❌ SKIP candidate failed: {error}")
+                traceback.print_exc()
+                cleanup_memory("skip-failed-candidate")
+                continue
 
-        await start_song_in_call(
-            chat_id,
-            next_song,
-            audio_url
-        )
-
-        print(f"✅ SKIP COMPLETE: {chat_id}")
-
-        return True
-
-    except Exception as error:
-        print(f"❌ SKIP ERROR: {error}")
-        traceback.print_exc()
-
-        try:
-            await bot.send_message(
-                chat_id,
-                f"❌ अगला गाना शुरू नहीं हो पाया: {str(error)[:250]}"
-            )
-        except Exception:
-            pass
-
+        if last_error:
+            try:
+                await bot.send_message(
+                    chat_id,
+                    "❌ Queue के अगले गाने उपलब्ध नहीं हो पाए। "
+                    "मौजूदा Playback को जारी रखा गया है।",
+                )
+            except Exception:
+                pass
         return False
 
     finally:
