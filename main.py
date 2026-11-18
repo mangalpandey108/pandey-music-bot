@@ -18,9 +18,9 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-# Bot और Assistant Clients
-bot = Client("MusicBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-assistant = Client("Assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+# Bot और Assistant Clients (in_memory=True कंटेनर रीस्टार्ट के समय लॉक एरर से बचाता है)
+bot = Client("MusicBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+assistant = Client("Assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True)
 call_py = PyTgCalls(assistant)
 
 # हर ग्रुप का स्वतंत्र Queue और Playback
@@ -250,7 +250,7 @@ async def main():
     me = await assistant.get_me()
     ASSISTANT_ID = me.id
     await call_py.start()
-    print(f"✅ Music Bot चालू हो गया है! Assistant: {me.first_name} ({ASSISTANT_ID})")
+    print(f"✅ Music Bot चालू हो गया है! Assistant: {me.first_name} ({ASSISTANT_ID})", flush=True)
     await idle()
     await bot.stop()
     await assistant.stop()
