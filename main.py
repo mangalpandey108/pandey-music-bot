@@ -6,7 +6,9 @@ os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 
-# yt-dlp को deployment में अलग से update करें; startup पर pip install न चलाएँ।\n\nimport gc
+# yt-dlp को deployment में अलग से update करें; startup पर pip install न चलाएँ।
+
+import gc
 import asyncio
 import traceback
 import time
