@@ -1,13 +1,17 @@
 import os
+import time
 import asyncio
+import traceback
 from collections import deque
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import UserNotParticipant, FloodWait
+from pyrogram.raw.functions.phone import CreateGroupCall
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream, AudioQuality
 from pytgcalls.types.stream import StreamEnded
+from pytgcalls.exceptions import NoActiveGroupCall
 import yt_dlp
 
 # .env फ़ाइल से वेरिएबल्स लोड करें
@@ -18,12 +22,12 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-# Bot और Assistant Clients (in_memory=True कंटेनर रीस्टार्ट के समय लॉक एरर से बचाता है)
+# Bot और Assistant Clients
 bot = Client("MusicBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 assistant = Client("Assistant", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING, in_memory=True)
 call_py = PyTgCalls(assistant)
 
-# हर ग्रुप का स्वतंत्र Queue और Playback
+# हर ग्रुप का स्वतंत्र Queue और डेटा
 queues = {}
 ASSISTANT_ID = None
 
@@ -37,13 +41,32 @@ ydl_opts = {
     "extract_flat": "in_playlist",
 }
 
+def get_control_buttons():
+    """मैसेज के नीचे दिखने वाले लाइव कंट्रोल बटन।"""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("⏸ Pause", callback_data="vc_pause"),
+                InlineKeyboardButton("▶️ Resume", callback_data="vc_resume"),
+                InlineKeyboardButton("⏭ Skip", callback_data="vc_skip"),
+            ],
+            [
+                InlineKeyboardButton("📜 Queue", callback_data="vc_queue"),
+                InlineKeyboardButton("⏹ Stop", callback_data="vc_stop"),
+            ],
+        ]
+    )
+
 def format_duration(seconds) -> str:
-    if not seconds:
+    if seconds is None:
         return "Live"
-    seconds = int(seconds)
-    mins, secs = divmod(seconds, 60)
-    hours, mins = divmod(mins, 60)
-    return f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
+    try:
+        seconds = int(seconds)
+        mins, secs = divmod(seconds, 60)
+        hours, mins = divmod(mins, 60)
+        return f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
+    except Exception:
+        return "Unknown"
 
 def search_youtube(query: str):
     """YouTube से गाने का टाइटल, अवधि और असली URL निकालता है।"""
@@ -55,7 +78,7 @@ def search_youtube(query: str):
             entries = list(info["entries"])
             if not entries:
                 return None
-            info = entries[0]
+            info = entries
 
         video_url = info.get("webpage_url") or info.get("url")
         if video_url and not video_url.startswith("http"):
@@ -69,8 +92,13 @@ def search_youtube(query: str):
 
 async def ensure_assistant_in_chat(chat_id: int) -> tuple[bool, str]:
     """Assistant को ग्रुप में चेक करता है और न होने पर इनवाइट लिंक से जोड़ता है।"""
+    global ASSISTANT_ID
     try:
-        await bot.get_chat_member(chat_id, ASSISTANT_ID)
+        if not ASSISTANT_ID:
+            me = await assistant.get_me()
+            ASSISTANT_ID = me.id
+
+        await bot.get_chat_member(chat_id, int(ASSISTANT_ID))
         return True, ""
     except UserNotParticipant:
         try:
@@ -84,7 +112,22 @@ async def ensure_assistant_in_chat(chat_id: int) -> tuple[bool, str]:
         except Exception as e:
             return False, f"❌ Assistant ग्रुप जॉइन नहीं कर सका। बॉट को **Invite Users** परमिशन दें या Assistant को खुद ग्रुप में जोड़ें।\n(`{e}`)"
     except Exception as e:
+        traceback.print_exc()
         return False, f"❌ त्रुटि: `{e}`"
+
+async def start_voice_chat_if_needed(chat_id: int):
+    """अगर ग्रुप में VC बंद है तो Assistant से खुद चालू करने की कोशिश करता है।"""
+    try:
+        peer = await assistant.resolve_peer(chat_id)
+        await assistant.invoke(
+            CreateGroupCall(
+                peer=peer,
+                random_id=assistant.rnd_id() // 9000000000,
+            )
+        )
+        await asyncio.sleep(1)
+    except Exception:
+        pass
 
 async def play_next_song(chat_id: int):
     """Queue का पहला गाना संबंधित ग्रुप के VC में चलाता है।"""
@@ -95,27 +138,34 @@ async def play_next_song(chat_id: int):
             pass
         return
 
-    current_song = queues[chat_id][0]
+    current_song = queues[chat_id]
+    stream = MediaStream(
+        current_song["webpage_url"],
+        audio_parameters=AudioQuality.HIGH,
+        video_flags=MediaStream.Flags.IGNORE,
+    )
+
     try:
-        await call_py.play(
-            chat_id,
-            MediaStream(
-                current_song["webpage_url"],
-                audio_parameters=AudioQuality.HIGH,
-                video_flags=MediaStream.Flags.IGNORE,
-            ),
-        )
+        try:
+            await call_py.play(chat_id, stream)
+        except NoActiveGroupCall:
+            # अगर VC बंद है, तो पहले VC चालू करें और फिर चलाएं
+            await start_voice_chat_if_needed(chat_id)
+            await call_py.play(chat_id, stream)
+
         await bot.send_message(
             chat_id,
-            f"▶️ **अब बज रहा है:** {current_song['title']}\n"
+            f"▶️ **अब बज रहा है:** [{current_song['title']}]({current_song['webpage_url']})\n"
             f"⏱ **अवधि:** `{current_song['duration']}`\n"
             f"👤 **अनुरोध:** {current_song['requester']}",
+            reply_markup=get_control_buttons(),
             disable_web_page_preview=True,
         )
     except Exception as e:
+        traceback.print_exc()
         await bot.send_message(
             chat_id,
-            f"❌ **गाना चलाने में त्रुटि:** `{e}`\n*(सुनिश्चित करें कि ग्रुप में Voice Chat चालू है)*"
+            f"❌ **गाना चलाने में त्रुटि:** `{e}`\n*(सुनिश्चित करें कि ग्रुप में Voice Chat चालू है और Assistant एडमिन है)*"
         )
         if chat_id in queues and queues[chat_id]:
             queues[chat_id].popleft()
@@ -136,14 +186,24 @@ async def on_stream_end(_, update):
 async def start_command(_, message: Message):
     await message.reply_text(
         "🎵 **Telegram VC Music Bot चालू है!**\n\n"
-        "**उपलब्ध कमांड्स (सिर्फ ग्रुप में):**\n"
-        "• `/play <गाने का नाम>` - गाना चलाएं या Queue में जोड़ें\n"
-        "• `/skip` - अगला गाना चलाएं\n"
+        "**उपलब्ध कमांड्स (ग्रुप में इस्तेमाल करें):**\n"
+        "• `/play <गाने का नाम या लिंक>` - गाना चलाएं या Queue में जोड़ें\n"
+        "• `/skip` - तुरंत अगला गाना चलाएं\n"
         "• `/pause` - गाना रोकें\n"
         "• `/resume` - गाना फिर से शुरू करें\n"
         "• `/queue` - ग्रुप की प्लेलिस्ट देखें\n"
-        "• `/stop` - प्लेबैक बंद करें और VC छोड़ें"
+        "• `/clear` - कतार (Queue) के अगले गाने हटाएं\n"
+        "• `/stop` - प्लेबैक बंद करें और VC छोड़ें\n"
+        "• `/ping` - बॉट की स्पीड चेक करें"
     )
+
+@bot.on_message(filters.command("ping"))
+async def ping_command(_, message: Message):
+    start_t = time.time()
+    msg = await message.reply_text("🏓 **Pinging...**")
+    end_t = time.time()
+    ms = round((end_t - start_t) * 1000, 2)
+    await msg.edit_text(f"🏓 **Pong!** `{ms} ms`\n✅ सिस्टम और VC इंजन पूरी तरह ऑनलाइन हैं।")
 
 @bot.on_message(filters.command("play") & filters.group)
 async def play_command(_, message: Message):
@@ -161,7 +221,11 @@ async def play_command(_, message: Message):
         return await status_msg.edit_text(err_msg)
 
     loop = asyncio.get_running_loop()
-    song = await loop.run_in_executor(None, search_youtube, query)
+    try:
+        song = await loop.run_in_executor(None, search_youtube, query)
+    except Exception as e:
+        traceback.print_exc()
+        return await status_msg.edit_text(f"❌ YouTube सर्च एरर: `{e}`")
 
     if not song or not song.get("webpage_url"):
         return await status_msg.edit_text("❌ कोई गाना नहीं मिला। कृपया दूसरा नाम या YouTube लिंक ट्राई करें।")
@@ -180,8 +244,9 @@ async def play_command(_, message: Message):
         position = len(queues[chat_id]) - 1
         await status_msg.edit_text(
             f"➕ **Queue में जोड़ा गया (#{position}):**\n"
-            f"🎵 {song['title']} (`{song['duration']}`)\n"
+            f"🎵 [{song['title']}]({song['webpage_url']}) (`{song['duration']}`)\n"
             f"👤 {requester}",
+            reply_markup=get_control_buttons(),
             disable_web_page_preview=True,
         )
 
@@ -200,7 +265,7 @@ async def pause_command(_, message: Message):
     chat_id = message.chat.id
     try:
         await call_py.pause_stream(chat_id)
-        await message.reply_text("⏸️ गाना **Pause** कर दिया गया है।")
+        await message.reply_text("⏸️ गाना **Pause** कर दिया गया है।", reply_markup=get_control_buttons())
     except Exception:
         await message.reply_text("❌ गाना Pause नहीं हो सका।")
 
@@ -209,51 +274,3 @@ async def resume_command(_, message: Message):
     chat_id = message.chat.id
     try:
         await call_py.resume_stream(chat_id)
-        await message.reply_text("▶️ गाना फिर से **Resume** कर दिया गया है।")
-    except Exception:
-        await message.reply_text("❌ गाना Resume नहीं हो सका।")
-
-@bot.on_message(filters.command("stop") & filters.group)
-async def stop_command(_, message: Message):
-    chat_id = message.chat.id
-    if chat_id in queues:
-        queues[chat_id].clear()
-    try:
-        await call_py.leave_call(chat_id)
-        await message.reply_text("⏹️ प्लेबैक बंद कर दिया गया और इस ग्रुप की Queue खाली कर दी गई।")
-    except Exception:
-        await message.reply_text("❌ Assistant अभी किसी VC में नहीं है।")
-
-@bot.on_message(filters.command("queue") & filters.group)
-async def queue_command(_, message: Message):
-    chat_id = message.chat.id
-    if chat_id not in queues or not queues[chat_id]:
-        return await message.reply_text("📭 इस ग्रुप की Queue खाली है।")
-
-    text = f"📜 **{message.chat.title} की Queue ({len(queues[chat_id])} गाने):**\n\n"
-    for idx, song in enumerate(queues[chat_id]):
-        if idx == 0:
-            text += f"▶️ **अभी बज रहा है:** {song['title']} (`{song['duration']}`) - {song['requester']}\n\n"
-        else:
-            text += f"**{idx}.** {song['title']} (`{song['duration']}`) - {song['requester']}\n"
-
-    if len(text) > 4000:
-        text = text[:3940] + f"\n\n...और कुल {len(queues[chat_id]) - 1} गाने कतार में हैं।"
-
-    await message.reply_text(text, disable_web_page_preview=True)
-
-# ================= STARTUP =================
-async def main():
-    global ASSISTANT_ID
-    await bot.start()
-    await assistant.start()
-    me = await assistant.get_me()
-    ASSISTANT_ID = me.id
-    await call_py.start()
-    print(f"✅ Music Bot चालू हो गया है! Assistant: {me.first_name} ({ASSISTANT_ID})", flush=True)
-    await idle()
-    await bot.stop()
-    await assistant.stop()
-
-if __name__ == "__main__":
-    asyncio.run(main())
