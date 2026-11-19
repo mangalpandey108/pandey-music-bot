@@ -1,67 +1,65 @@
+# Pandey Music Bot - SillyDev / Python 3.11
+# Commands: /play /pause /resume /skip /queue /end /ping
+
 import os
-import re
 import asyncio
 import logging
+import inspect
 from collections import defaultdict, deque
+from pathlib import Path
 
-import yt_dlp
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
-from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream, AudioQuality
+from yt_dlp import YoutubeDL
+from pytgcalls import PyTgCalls, filters as call_filters
+from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 
 load_dotenv()
 
-# ---------------- CONFIG ----------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("PandeyMusicBot")
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
+try:
+    API_ID = int(os.getenv("API_ID", "0"))
+except ValueError:
+    API_ID = 0
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+# If SESSION_STRING is empty, Pyrogram will use this existing file, e.g. Assistant.session
+USER_SESSION_NAME = os.getenv("USER_SESSION_NAME", "Assistant").strip() or "Assistant"
+DURATION_LIMIT = max(60, int(os.getenv("DURATION_LIMIT", "3600")))
+QUEUE_LIMIT = max(1, int(os.getenv("QUEUE_LIMIT", "20")))
 
-DURATION_LIMIT = int(os.getenv("DURATION_LIMIT", "3600"))
-QUEUE_LIMIT = int(os.getenv("QUEUE_LIMIT", "20"))
-
-if not all([API_ID, API_HASH, BOT_TOKEN, SESSION_STRING]):
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise RuntimeError(".env mein API_ID, API_HASH aur BOT_TOKEN sahi se set karein.")
+if not SESSION_STRING and not Path(f"{USER_SESSION_NAME}.session").exists():
     raise RuntimeError(
-        "Missing API_ID, API_HASH, BOT_TOKEN or SESSION_STRING"
+        f"User session nahi mila: {USER_SESSION_NAME}.session. "
+        "Valid SESSION_STRING dein ya USER_SESSION_NAME ko maujooda session file ke naam par set karein."
     )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("MusicBot")
-
-# ---------------- CLIENTS ----------------
-
 bot = Client(
-    "music_bot",
+    "PandeyBotClient",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
 )
 
-user = Client(
-    "music_user",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
-
+user_args = {"api_id": API_ID, "api_hash": API_HASH}
+if SESSION_STRING:
+    user_args["session_string"] = SESSION_STRING
+user = Client(USER_SESSION_NAME, **user_args)
 calls = PyTgCalls(user)
 
-# ---------------- STORAGE ----------------
-
 queues = defaultdict(deque)
-playing = set()
 locks = defaultdict(asyncio.Lock)
 
-
-# ---------------- YOUTUBE ----------------
-
-YDL_OPTIONS = {
+YDL_BASE = {
     "format": "bestaudio/best",
     "quiet": True,
     "no_warnings": True,
@@ -71,265 +69,226 @@ YDL_OPTIONS = {
     "retries": 2,
     "extractor_retries": 2,
     "cachedir": False,
-    "default_search": "ytsearch1",
 }
+if Path("cookies.txt").is_file():
+    YDL_BASE["cookiefile"] = "cookies.txt"
 
-def extract_song(query):
-    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+
+def search_song(query: str) -> dict:
+    """Find one YouTube result; do not keep an expiring media URL in the queue."""
+    options = {**YDL_BASE, "default_search": "ytsearch1"}
+    with YoutubeDL(options) as ydl:
         info = ydl.extract_info(query, download=False)
-
-        if "entries" in info:
-            info = next(
-                (entry for entry in info["entries"] if entry),
-                None
-            )
-
-        if not info:
-            raise ValueError("Song not found")
-
-        duration = int(info.get("duration") or 0)
-
-        if duration > DURATION_LIMIT:
-            raise ValueError("Song duration limit exceeded")
-
-        return {
-            "title": info.get("title", "Unknown"),
-            "url": info["url"],
-            "webpage": info.get("webpage_url", query),
-            "duration": duration,
-        }
+    if info and "entries" in info:
+        info = next((entry for entry in info["entries"] if entry), None)
+    if not info:
+        raise ValueError("YouTube par song nahi mila.")
+    duration = int(info.get("duration") or 0)
+    if duration and duration > DURATION_LIMIT:
+        raise ValueError(f"Song duration limit se lamba hai ({DURATION_LIMIT} seconds).")
+    webpage_url = info.get("webpage_url") or info.get("original_url")
+    if not webpage_url:
+        raise ValueError("YouTube ka playable link nahi mila.")
+    return {
+        "title": info.get("title") or "Unknown title",
+        "webpage_url": webpage_url,
+        "duration": duration,
+    }
 
 
-async def get_song(query):
-    return await asyncio.to_thread(extract_song, query)
+def get_fresh_stream_url(webpage_url: str) -> str:
+    """Resolve the direct audio URL immediately before playback (fresh URL)."""
+    with YoutubeDL(YDL_BASE) as ydl:
+        info = ydl.extract_info(webpage_url, download=False)
+    if not info or not info.get("url"):
+        raise ValueError("YouTube audio stream resolve nahi hua.")
+    return info["url"]
 
 
-# ---------------- PLAYBACK ----------------
+async def delete_command(message):
+    # Bot ko group mein Delete Messages permission chahiye.
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
-async def play_next(chat_id):
+
+async def send_reply(message, text):
+    try:
+        return await message.reply_text(text, quote=False)
+    except FloodWait as exc:
+        await asyncio.sleep(exc.value)
+        return await message.reply_text(text, quote=False)
+
+
+async def start_track(chat_id: int, track: dict):
+    stream_url = await asyncio.to_thread(get_fresh_stream_url, track["webpage_url"])
+    # AudioQuality.HIGH gives the high-quality audio profile supported by PyTgCalls.
+    await calls.play(chat_id, MediaStream(stream_url, AudioQuality.HIGH))
+    log.info("Now playing in %s: %s", chat_id, track["title"])
+
+
+async def play_next(chat_id: int):
     async with locks[chat_id]:
         if not queues[chat_id]:
-            playing.discard(chat_id)
-            return False
-
-        song = queues[chat_id].popleft()
-
+            return None
+        track = queues[chat_id].popleft()
         try:
-            await calls.play(
-                chat_id,
-                MediaStream(
-                    song["url"],
-                    AudioQuality.HIGH
-                )
-            )
-
-            playing.add(chat_id)
-            return song
-
+            await start_track(chat_id, track)
+            return track
         except Exception:
-            log.exception("Playback failed in %s", chat_id)
-            playing.discard(chat_id)
-            return False
+            log.exception("Could not start queued track in %s", chat_id)
+            # Try the next queued item if this one has become unavailable.
+            if queues[chat_id]:
+                next_track = queues[chat_id].popleft()
+                try:
+                    await start_track(chat_id, next_track)
+                    return next_track
+                except Exception:
+                    log.exception("Next queued track also failed in %s", chat_id)
+            return None
 
 
-# ---------------- COMMANDS ----------------
-
-@bot.on_message(filters.command("start"))
-async def start_command(_, message):
-    await message.reply_text(
-        "🎵 **YouTube Music Bot is Online!**\n\n"
-        "/play song name - Play music\n"
-        "/pause - Pause music\n"
-        "/resume - Resume music\n"
-        "/skip - Skip current song\n"
-        "/queue - Show queue\n"
-        "/end - Stop music\n"
-        "/help - Commands"
-    )
-
-
-@bot.on_message(filters.command("help"))
-async def help_command(_, message):
-    await message.reply_text(
-        "**Music Commands**\n\n"
-        "`/play song name`\n"
-        "`/pause`\n"
-        "`/resume`\n"
-        "`/skip`\n"
-        "`/queue`\n"
-        "`/end`"
-    )
+@calls.on_update(call_filters.stream_end())
+async def on_stream_end(_, update: StreamEnded):
+    """Automatically play the next queued song when the current stream ends."""
+    chat_id = update.chat_id
+    log.info("Stream ended in %s", chat_id)
+    track = await play_next(chat_id)
+    if track:
+        try:
+            await bot.send_message(chat_id, f"▶️ **Now Playing:** {track['title']}")
+        except Exception:
+            log.exception("Could not send now-playing message")
 
 
 @bot.on_message(filters.command("play") & filters.group)
-async def play_command(_, message):
+async def play_cmd(_, message):
     if len(message.command) < 2:
-        return await message.reply_text(
-            "Usage: `/play song name or YouTube URL`"
-        )
+        await delete_command(message)
+        return await send_reply(message, "Use: `/play song name`")
 
-    query = message.text.split(maxsplit=1)[1].strip()
-    status = await message.reply_text("🔎 Searching YouTube...")
-
+    query = " ".join(message.command[1:]).strip()
+    status = await send_reply(message, "🔎 Song search ho raha hai...")
+    await delete_command(message)
     try:
-        song = await get_song(query)
-
-        if len(queues[message.chat.id]) >= QUEUE_LIMIT:
-            return await status.edit_text("❌ Queue is full.")
-
+        track = await asyncio.to_thread(search_song, query)
         chat_id = message.chat.id
-
         async with locks[chat_id]:
-            if chat_id in playing:
-                queues[chat_id].append(song)
-                position = len(queues[chat_id])
-                await status.edit_text(
-                    f"➕ **Added to Queue**\n\n"
-                    f"🎵 {song['title']}\n"
-                    f"📌 Position: {position}"
-                )
-                return
-
             try:
-                await calls.play(
-                    chat_id,
-                    MediaStream(
-                        song["url"],
-                        AudioQuality.HIGH
-                    )
-                )
-                playing.add(chat_id)
-
+                current_call = await calls.get_call(chat_id)
             except Exception:
-                log.exception("Could not start playback")
-                raise RuntimeError(
-                    "Voice Chat start nahi hua. "
-                    "User account ko group mein add karein."
-                )
-
-        await status.edit_text(
-            f"▶️ **Now Playing**\n\n"
-            f"🎵 {song['title']}\n"
-            f"⏱ Duration: {song['duration']} seconds\n"
-            f"🔗 [YouTube]({song['webpage']})"
-        )
-
-    except Exception as error:
-        log.exception("Play command error")
-        await status.edit_text(f"❌ Error: {str(error)[:300]}")
-
-
-@bot.on_message(filters.command("pause") & filters.group)
-async def pause_command(_, message):
-    try:
-        await calls.pause(message.chat.id)
-        await message.reply_text("⏸ Music Paused.")
-    except Exception as error:
-        await message.reply_text(f"❌ {str(error)[:200]}")
-
-
-@bot.on_message(filters.command("resume") & filters.group)
-async def resume_command(_, message):
-    try:
-        await calls.resume(message.chat.id)
-        await message.reply_text("▶️ Music Resumed.")
-    except Exception as error:
-        await message.reply_text(f"❌ {str(error)[:200]}")
+                current_call = None
+            if current_call is not None:
+                if len(queues[chat_id]) >= QUEUE_LIMIT:
+                    return await status.edit_text("❌ Queue full hai.")
+                queues[chat_id].append(track)
+                return await status.edit_text(f"➕ **Queue mein add kiya:** {track['title']}")
+            await start_track(chat_id, track)
+        await status.edit_text(f"▶️ **Now Playing:** {track['title']}")
+    except Exception as exc:
+        log.exception("/play failed")
+        try:
+            await status.edit_text(f"❌ Play nahi ho paya: `{str(exc)[:700]}`")
+        except Exception:
+            pass
 
 
 @bot.on_message(filters.command("skip") & filters.group)
-async def skip_command(_, message):
+async def skip_cmd(_, message):
+    await delete_command(message)
     chat_id = message.chat.id
-
-    async with locks[chat_id]:
-        if chat_id not in playing:
-            return await message.reply_text("❌ Nothing is playing.")
-
-        try:
-            await calls.stop(chat_id)
-        except Exception:
-            log.exception("Stop failed")
-
-        playing.discard(chat_id)
-
-        if not queues[chat_id]:
-            await message.reply_text("⏭ Skipped. Queue is empty.")
-            return
-
-        song = queues[chat_id].popleft()
-
-        try:
-            await calls.play(
-                chat_id,
-                MediaStream(song["url"], AudioQuality.HIGH)
-            )
-            playing.add(chat_id)
-
-            await message.reply_text(
-                f"⏭ **Skipped!**\n▶️ Now Playing: {song['title']}"
-            )
-        except Exception as error:
-            log.exception("Next song failed")
-            await message.reply_text(f"❌ Playback error: {str(error)[:200]}")
-
-
-@bot.on_message(filters.command("queue") & filters.group)
-async def queue_command(_, message):
-    chat_id = message.chat.id
-    songs = list(queues[chat_id])
-
-    if not songs:
-        return await message.reply_text("📭 Queue is empty.")
-
-    output = "\n".join(
-        f"{i}. {song['title']}"
-        for i, song in enumerate(songs[:15], 1)
-    )
-
-    await message.reply_text(f"📃 **Upcoming Songs**\n\n{output}")
+    try:
+        await calls.leave_call(chat_id)
+    except Exception:
+        pass
+    track = await play_next(chat_id)
+    if track:
+        await send_reply(message, f"⏭️ **Skipped. Now Playing:** {track['title']}")
+    else:
+        await send_reply(message, "⏭️ Skipped. Queue khali hai ya agla song play nahi hua.")
 
 
 @bot.on_message(filters.command("end") & filters.group)
-async def end_command(_, message):
+async def end_cmd(_, message):
+    await delete_command(message)
     chat_id = message.chat.id
-
     async with locks[chat_id]:
         queues[chat_id].clear()
-
         try:
-            await calls.stop(chat_id)
+            await calls.leave_call(chat_id)
         except Exception:
-            log.exception("Stop error")
-
-        playing.discard(chat_id)
-
-    await message.reply_text("⏹ Music stopped and queue cleared.")
+            pass
+    await send_reply(message, "⏹️ Playback band aur queue clear kar di.")
 
 
-# ---------------- ERROR HANDLING ----------------
+@bot.on_message(filters.command("queue") & filters.group)
+async def queue_cmd(_, message):
+    await delete_command(message)
+    items = list(queues[message.chat.id])
+    if not items:
+        return await send_reply(message, "📭 Queue khali hai.")
+    lines = [f"{i}. {item['title']}" for i, item in enumerate(items[:20], 1)]
+    await send_reply(message, "**🎶 Upcoming Queue:**\n" + "\n".join(lines))
+
+
+@bot.on_message(filters.command("pause") & filters.group)
+async def pause_cmd(_, message):
+    await delete_command(message)
+    try:
+        await calls.pause(message.chat.id)
+        await send_reply(message, "⏸️ Paused.")
+    except Exception as exc:
+        await send_reply(message, f"Pause error: `{str(exc)[:400]}`")
+
+
+@bot.on_message(filters.command("resume") & filters.group)
+async def resume_cmd(_, message):
+    await delete_command(message)
+    try:
+        await calls.resume(message.chat.id)
+        await send_reply(message, "▶️ Resumed.")
+    except Exception as exc:
+        await send_reply(message, f"Resume error: `{str(exc)[:400]}`")
+
 
 @bot.on_message(filters.command("ping"))
-async def ping_command(_, message):
-    await message.reply_text("🏓 Pong! Bot is alive.")
+async def ping_cmd(_, message):
+    await delete_command(message)
+    await send_reply(message, "🏓 Pandey Music Bot online hai.")
+
+
+async def maybe_await(value):
+    # PyTgCalls start() is synchronous in some 3.0.x builds and awaitable in others.
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 async def main():
-    await bot.start()
-    log.info("Bot client started")
-
-    await user.start()
-    log.info("User client started")
-
-    calls.start()
-    log.info("PyTgCalls started")
-
-    log.info("YouTube Music Bot is running")
-
-    await asyncio.Event().wait()
+    try:
+        await bot.start()
+        await user.start()
+        await maybe_await(calls.start())
+        log.info("Pandey Music Bot started successfully.")
+        await asyncio.Event().wait()
+    finally:
+        try:
+            await maybe_await(calls.stop())
+        except Exception:
+            pass
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+        try:
+            await user.stop()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Bot stopped")
+        log.info("Bot stopped by user.")
