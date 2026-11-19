@@ -412,6 +412,13 @@ def extract_audio_url(video_url):
     else:
         print("⚠️ Deno उपलब्ध नहीं है। yt-dlp बिना Deno चलेगा।")
 
+    # The host cgroup is only ~294 MiB. The Deno child was OOM-killed
+    # (memory.events reported oom_kill=1), so cap V8's heap for this child.
+    # DENO_V8_FLAGS is inherited by yt-dlp's Deno subprocess.
+    previous_v8_flags = os.environ.get("DENO_V8_FLAGS")
+    low_memory_v8_flags = "--max-old-space-size=64 --max-semi-space-size=4"
+    os.environ["DENO_V8_FLAGS"] = low_memory_v8_flags
+    print(f"🧠 Deno low-memory V8 flags: {low_memory_v8_flags}")
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(video_url, download=False)
@@ -433,6 +440,12 @@ def extract_audio_url(video_url):
         raise RuntimeError(
             f"yt-dlp extraction असफल: {error_text[:700]}"
         ) from error
+
+    finally:
+        if previous_v8_flags is None:
+            os.environ.pop("DENO_V8_FLAGS", None)
+        else:
+            os.environ["DENO_V8_FLAGS"] = previous_v8_flags
 
     if not info:
         raise RuntimeError("YouTube audio information नहीं मिली।")
@@ -1008,14 +1021,14 @@ async def main():
         api_id=API_ID,
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
-        workers=4
+        workers=2
     )
 
     user = Client(
         "FreshLogin",
         api_id=API_ID,
         api_hash=API_HASH,
-        workers=4
+        workers=2
     )
 
     calls = PyTgCalls(user)
@@ -1095,12 +1108,19 @@ async def main():
 
         # PyTgCalls background tasks को clients से पहले साफ करें।
         try:
-            if calls:
-                await calls.stop()
+            stop_method = getattr(calls, "stop", None) if calls else None
+            if callable(stop_method):
+                result = stop_method()
+                if asyncio.iscoroutine(result):
+                    await result
                 print("✅ PyTgCalls Stopped")
+            else:
+                print(
+                    "ℹ️ इस PyTgCalls version में stop() method नहीं है; "
+                    "User Client बंद होने पर call transport cleanup होगा।"
+                )
         except Exception as stop_error:
-            print(f"⚠️ PyTgCalls stop warning: {stop_error}")
-            traceback.print_exc()
+            print(f"⚠️ PyTgCalls cleanup warning: {stop_error}")
 
         try:
             if user and user.is_connected:
