@@ -416,7 +416,7 @@ def extract_audio_url(video_url):
     # (memory.events reported oom_kill=1), so cap V8's heap for this child.
     # DENO_V8_FLAGS is inherited by yt-dlp's Deno subprocess.
     previous_v8_flags = os.environ.get("DENO_V8_FLAGS")
-    low_memory_v8_flags = "--max-old-space-size=64 --max-semi-space-size=4"
+    low_memory_v8_flags = "--max-old-space-size=64"
     os.environ["DENO_V8_FLAGS"] = low_memory_v8_flags
     print(f"🧠 Deno low-memory V8 flags: {low_memory_v8_flags}")
     try:
