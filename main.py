@@ -10,6 +10,7 @@ import platform
 import zipfile
 import subprocess
 import stat
+import importlib.metadata
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -290,14 +291,94 @@ def search_youtube(query):
     }
 
 
+# ================= RUNTIME DIAGNOSTICS =================
+
+def _read_text_file(path):
+    try:
+        return Path(path).read_text(errors="replace").strip()
+    except Exception:
+        return "unavailable"
+
+def _memory_diagnostics():
+    """Host/cgroup memory details; never reads or prints secrets."""
+    print("\n========== SYSTEM DIAGNOSTICS ==========")
+    print(f"🖥️ OS/Arch: {platform.platform()} | {platform.machine()}")
+    print(f"🐍 Python: {platform.python_version()}")
+    print(f"📦 yt-dlp: {getattr(yt_dlp.version, '__version__', 'unknown')}")
+    for package in ("yt-dlp-ejs", "pyrogram", "py-tgcalls", "ntgcalls"):
+        try:
+            print(f"📦 {package}: {importlib.metadata.version(package)}")
+        except Exception:
+            print(f"📦 {package}: not installed / metadata unavailable")
+
+    meminfo = _read_text_file('/proc/meminfo')
+    if meminfo != "unavailable":
+        for line in meminfo.splitlines():
+            if line.startswith(("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:")):
+                print(f"🧠 {line}")
+
+    process_status = _read_text_file('/proc/self/status')
+    if process_status != "unavailable":
+        for line in process_status.splitlines():
+            if line.startswith(("VmRSS:", "VmHWM:", "Threads:")):
+                print(f"🧩 Python process {line}")
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        try:
+            ffmpeg_result = subprocess.run(
+                [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5
+            )
+            first_line = (ffmpeg_result.stdout or ffmpeg_result.stderr).splitlines()
+            print(f"🎞️ FFmpeg: {first_line[0] if first_line else ffmpeg_path}")
+        except Exception as error:
+            print(f"⚠️ FFmpeg check failed: {type(error).__name__}: {error}")
+    else:
+        print("🔴 FFmpeg: NOT FOUND in PATH")
+
+    for cgroup_file in (
+        '/sys/fs/cgroup/memory.max',
+        '/sys/fs/cgroup/memory.current',
+        '/sys/fs/cgroup/memory.events',
+        '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+        '/sys/fs/cgroup/memory/memory.usage_in_bytes',
+    ):
+        value = _read_text_file(cgroup_file)
+        if value != "unavailable":
+            print(f"📊 {cgroup_file}: {value.replace(chr(10), '; ')}")
+
+    if DENO_PATH:
+        try:
+            result = subprocess.run(
+                [str(DENO_PATH), '--version'], capture_output=True, text=True, timeout=8
+            )
+            print(f"🟢 Deno check returncode: {result.returncode}")
+            print(f"🟢 Deno version: {(result.stdout or result.stderr).strip()[:500]}")
+        except Exception as error:
+            print(f"🔴 Deno check failed: {type(error).__name__}: {error}")
+    else:
+        print("🔴 Deno path: NOT FOUND")
+
+    cookie_path = Path('/home/container/cookies.txt')
+    if cookie_path.is_file():
+        try:
+            print(f"🍪 cookies.txt: present | bytes={cookie_path.stat().st_size} | readable={os.access(cookie_path, os.R_OK)}")
+        except Exception:
+            print("🍪 cookies.txt: present | metadata unavailable")
+    else:
+        print("🍪 cookies.txt: MISSING")
+    print("========== END DIAGNOSTICS ==========\n")
+
+
 # ================= AUDIO EXTRACTION =================
 
 def extract_audio_url(video_url):
     started = time.perf_counter()
 
     options = {
-        # Direct HTTPS audio चुनें और अनावश्यक manifest extraction छोड़ें।
-        "format": "bestaudio[protocol=https]/bestaudio",
+        # पहले सर्वोत्तम audio, फिर video+audio वाले सामान्य format को fallback दें।
+        # Protocol को force नहीं करते: इससे YouTube के उपलब्ध audio formats नहीं छूटेंगे।
+        "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": False,
         "noplaylist": True,
@@ -308,12 +389,7 @@ def extract_audio_url(video_url):
         "fragment_retries": 0,
         "file_access_retries": 0,
         "cachedir": False,
-        "concurrent_fragment_downloads": 1,
-        "extractor_args": {
-            "youtube": {
-                "skip": ["hls", "dash"]
-            }
-        }
+        "concurrent_fragment_downloads": 1
     }
 
     # Use a locally stored YouTube cookie export when available.
@@ -343,6 +419,11 @@ def extract_audio_url(video_url):
     except yt_dlp.utils.DownloadError as error:
         error_text = str(error)
         lowered = error_text.casefold()
+        print("\n🧪 YOUTUBE EXTRACTION FAILURE DIAGNOSTICS")
+        print(f"🔎 URL: {video_url}")
+        print(f"🔎 yt-dlp error: {error_text[:1200]}")
+        print(f"🔎 Deno path: {deno_path or 'NOT FOUND'}")
+        _memory_diagnostics()
 
         if "sign in to confirm you're not a bot" in lowered:
             raise RuntimeError(
@@ -919,6 +1000,8 @@ async def main():
         print(f"✅ Deno Runtime Ready: {DENO_PATH}")
     else:
         print("⚠️ Deno उपलब्ध नहीं है; yt-dlp fallback mode में चलेगा।")
+
+    _memory_diagnostics()
 
     bot = Client(
         "PandeyMusicBot",
