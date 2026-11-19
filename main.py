@@ -194,8 +194,19 @@ http = requests.Session()
 
 # ================= BUTTONS =================
 
-def music_buttons():
-    return InlineKeyboardMarkup([
+def music_buttons(song=None):
+    """सभी music commands के inline buttons और owner profile link."""
+    rows = []
+    if song and song.get("requester_id"):
+        requester_name = (song.get("requester_name") or "Song Requester").strip()
+        rows.append([
+            InlineKeyboardButton(
+                f"👤 {requester_name[:35]} • ID देखें",
+                callback_data=f"profile:{int(song['requester_id'])}"
+            )
+        ])
+
+    rows.extend([
         [
             InlineKeyboardButton("▶️ Resume", callback_data="music:resume"),
             InlineKeyboardButton("⏸️ Pause", callback_data="music:pause")
@@ -208,42 +219,49 @@ def music_buttons():
             InlineKeyboardButton("📋 Queue", callback_data="music:queue"),
             InlineKeyboardButton("🎵 Play", callback_data="music:play")
         ],
-        [
-            InlineKeyboardButton("🛑 End", callback_data="music:end")
-        ]
+        [InlineKeyboardButton("🛑 End", callback_data="music:end")],
+        [InlineKeyboardButton("👑 Owner", url="https://t.me/THE_PANDEY_G")]
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def requester_tag(song):
     user_id = song.get("requester_id")
     name = song.get("requester_name") or "Unknown User"
     safe_name = html.escape(name)
-
     if user_id:
         return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
-
     return safe_name
 
 
 async def send_now_playing(chat_id, song):
     title = html.escape(song.get("title", "Unknown Song"))
     requested_by = requester_tag(song)
-
     text = (
-        "🎵 <b>NOW PLAYING</b>\n\n"
+        "🎵 <b>PANDEY MUSIC BOT</b> 🎵\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎶 <b>NOW PLAYING</b>\n\n"
         f"🎧 <b>Song:</b> {title}\n"
         f"👤 <b>Requested by:</b> {requested_by}\n\n"
-        "🎛 <b>Music Controls</b>"
+        "🎛 <b>Music Controls</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "👑 <b>Owner:</b> @THE_PANDEY_G"
     )
-
     sent = await bot.send_message(
         chat_id,
         text,
-        reply_markup=music_buttons(),
+        reply_markup=music_buttons(song),
         parse_mode=enums.ParseMode.HTML
     )
-
     now_playing_messages[chat_id] = sent
+
+
+async def delete_command_message(message, command_name):
+    """हर slash command को delete करने की कोशिश; group में Delete permission जरूरी है."""
+    try:
+        await message.delete()
+    except Exception as error:
+        print(f"⚠️ /{command_name} command delete नहीं हुआ: {error}")
 
 
 # ================= YOUTUBE SEARCH =================
@@ -607,6 +625,14 @@ async def skip_music(chat_id):
 # ================= BUTTON CALLBACK =================
 
 async def music_callback(client, query):
+    if query.data.startswith("profile:"):
+        try:
+            target_id = int(query.data.split(":", 1)[1])
+            await query.answer(f"User ID: {target_id}", show_alert=True)
+        except Exception:
+            await query.answer("User ID उपलब्ध नहीं है।", show_alert=True)
+        return
+
     if not query.message:
         await query.answer("यह बटन उपलब्ध नहीं है।", show_alert=True)
         return
@@ -693,8 +719,9 @@ async def music_callback(client, query):
 # ================= START COMMAND =================
 
 async def start_command(client, message):
+    await delete_command_message(message, "start")
     await message.reply_text(
-        "🎵 Pandey Music Bot ऑनलाइन है!\n\n"
+        "🎵 <b>PANDEY MUSIC BOT</b> 🎵\n\n"
         "Commands:\n"
         "/play गाने का नाम\n"
         "/pause - Pause\n"
@@ -703,7 +730,9 @@ async def start_command(client, message):
         "/stop - Playback बंद\n"
         "/end - Playback समाप्त\n"
         "/queue - Queue देखें\n\n"
-        "🎛 Music Controls के लिए Now Playing Buttons इस्तेमाल करें।"
+        "🎛 नीचे दिए गए सभी buttons इस्तेमाल करें।\n\n👑 Owner: @THE_PANDEY_G",
+        reply_markup=music_buttons(),
+        parse_mode=enums.ParseMode.HTML
     )
 
 
@@ -712,12 +741,7 @@ async def start_command(client, message):
 async def play_command(client, message):
     chat_id = message.chat.id
 
-    # /play command message को chat से हटाने की कोशिश करें।
-    # Telegram में इसके लिए bot को group में message delete permission चाहिए।
-    try:
-        await message.delete()
-    except Exception as delete_error:
-        print(f"⚠️ /play command delete नहीं हो पाया: {delete_error}")
+    await delete_command_message(message, "play")
 
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
@@ -816,6 +840,7 @@ async def play_command(client, message):
 # ================= PAUSE COMMAND =================
 
 async def pause_command(client, message):
+    await delete_command_message(message, "pause")
     chat_id = message.chat.id
 
     try:
@@ -834,6 +859,7 @@ async def pause_command(client, message):
 # ================= RESUME COMMAND =================
 
 async def resume_command(client, message):
+    await delete_command_message(message, "resume")
     chat_id = message.chat.id
 
     try:
@@ -852,6 +878,7 @@ async def resume_command(client, message):
 # ================= SKIP COMMAND =================
 
 async def skip_command(client, message):
+    await delete_command_message(message, "skip")
     chat_id = message.chat.id
 
     try:
@@ -875,6 +902,7 @@ async def skip_command(client, message):
 # ================= STOP COMMAND =================
 
 async def stop_command(client, message):
+    await delete_command_message(message, "stop")
     chat_id = message.chat.id
 
     try:
@@ -898,6 +926,7 @@ async def end_command(client, message):
 # ================= QUEUE COMMAND =================
 
 async def queue_command(client, message):
+    await delete_command_message(message, "queue")
     await message.reply_text(make_queue_text(message.chat.id))
 
 
@@ -982,7 +1011,7 @@ async def main():
         bot.add_handler(
             CallbackQueryHandler(
                 music_callback,
-                filters.regex(r"^music:")
+                filters.regex(r"^(music|profile):")
             )
         )
 
