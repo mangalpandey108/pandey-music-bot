@@ -46,19 +46,29 @@ API_ID = int(API_ID_TEXT)
 # ================= DENO AUTO INSTALLER =================
 
 def setup_deno():
-    """
-    Deno की official GitHub release डाउनलोड करके
-    server के writable folder में install करने की कोशिश करता है।
+    """System Deno या पहले से डाउनलोड Deno को पहले इस्तेमाल करें।
+    जरूरत पड़ने और AUTO_INSTALL_DENO=1 होने पर ही नया Deno डाउनलोड करें।
     """
 
+    # 1) पहले PATH में मौजूद system Deno जाँचें।
     existing = shutil.which("deno")
-
     if existing:
-        print(f"✅ System Deno Found: {existing}")
-        return existing
+        try:
+            result = subprocess.run(
+                [existing, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if result.returncode == 0:
+                print(f"✅ System Deno Ready: {existing}")
+                return existing
+            print("⚠️ System Deno मिला, लेकिन चल नहीं पाया; local Deno जाँच रहे हैं।")
+        except Exception as error:
+            print(f"⚠️ System Deno जाँच असफल: {error}")
 
-    # पहले से मौजूद local Deno को हमेशा इस्तेमाल करें।
-    if DENO_BIN.exists():
+    # 2) AUTO_INSTALL_DENO बंद होने पर भी पहले से मौजूद local Deno इस्तेमाल करें।
+    if DENO_BIN.is_file():
         try:
             os.chmod(DENO_BIN, 0o755)
             result = subprocess.run(
@@ -68,18 +78,27 @@ def setup_deno():
                 timeout=15
             )
             if result.returncode == 0:
+                os.environ["PATH"] = (
+                    str(DENO_DIR) + os.pathsep + os.environ.get("PATH", "")
+                )
                 print("✅ पहले से डाउनलोड किया हुआ Deno मिला।")
+                print(f"✅ Deno Runtime Ready: {DENO_BIN}")
                 return str(DENO_BIN)
+            print("⚠️ Local Deno मिला, लेकिन चल नहीं पाया; जरूरत पर दोबारा डाउनलोड होगा।")
         except Exception as error:
             print(f"⚠️ Existing Deno इस्तेमाल नहीं हो सका: {error}")
 
-    # जरूरत पड़ने पर ही नया Deno डाउनलोड करें।
+    # 3) दोनों जगह Deno न मिले तो auto-install setting देखें।
     if not AUTO_INSTALL_DENO:
-        print("ℹ️ Deno नहीं मिला। .env में AUTO_INSTALL_DENO=1 करें या Deno install करें।")
+        print("⚠️ Deno नहीं मिला और AUTO_INSTALL_DENO बंद है।")
+        print("ℹ️ .env में AUTO_INSTALL_DENO=1 करने पर Deno डाउनलोड होगा।")
+        return None
+
+    if platform.system().lower() != "linux":
+        print("❌ यह installer Linux server के लिए बनाया गया है।")
         return None
 
     machine = platform.machine().lower()
-
     if machine in ("x86_64", "amd64"):
         asset_name = "deno-x86_64-unknown-linux-gnu.zip"
     elif machine in ("aarch64", "arm64"):
@@ -88,22 +107,16 @@ def setup_deno():
         print(f"❌ Unsupported server architecture: {machine}")
         return None
 
-    if platform.system().lower() != "linux":
-        print("❌ यह installer Linux server के लिए बनाया गया है।")
-        return None
-
     zip_path = DENO_DIR / "deno-download.zip"
 
     try:
         DENO_DIR.mkdir(parents=True, exist_ok=True)
-
         download_url = (
             "https://github.com/denoland/deno/releases/latest/download/"
             + asset_name
         )
 
         print("⬇️ Official Deno download शुरू हो रहा है...")
-
         response = requests.get(
             download_url,
             stream=True,
@@ -117,11 +130,9 @@ def setup_deno():
                     file.write(chunk)
 
         print("📦 Deno ZIP डाउनलोड पूरा हुआ।")
-
         with zipfile.ZipFile(zip_path, "r") as archive:
             if "deno" not in archive.namelist():
                 raise RuntimeError("ZIP में Deno executable नहीं मिला।")
-
             archive.extract("deno", path=DENO_DIR)
 
         os.chmod(
@@ -137,28 +148,20 @@ def setup_deno():
             text=True,
             timeout=20
         )
-
         if result.returncode != 0:
-            raise RuntimeError(
-                result.stderr or "Deno executable नहीं चल पाया।"
-            )
+            raise RuntimeError(result.stderr or "Deno executable नहीं चल पाया।")
 
         os.environ["PATH"] = (
             str(DENO_DIR) + os.pathsep + os.environ.get("PATH", "")
         )
-
         print("✅ Deno Successfully Installed!")
         print(result.stdout.strip())
-
         return str(DENO_BIN)
 
     except Exception as error:
         print("❌ Deno Auto Installation असफल!")
         print(f"कारण: {type(error).__name__}: {error}")
-        print(
-            "ℹ️ SillyDev ने download या executable permission "
-            "रोक रखी हो सकती है।"
-        )
+        print("ℹ️ SillyDev ने download या executable permission रोक रखी हो सकती है।")
         return None
 
     finally:
@@ -194,19 +197,8 @@ http = requests.Session()
 
 # ================= BUTTONS =================
 
-def music_buttons(song=None):
-    """सभी music commands के inline buttons और owner profile link."""
-    rows = []
-    if song and song.get("requester_id"):
-        requester_name = (song.get("requester_name") or "Song Requester").strip()
-        rows.append([
-            InlineKeyboardButton(
-                f"👤 {requester_name[:35]} • ID देखें",
-                callback_data=f"profile:{int(song['requester_id'])}"
-            )
-        ])
-
-    rows.extend([
+def music_buttons():
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("▶️ Resume", callback_data="music:resume"),
             InlineKeyboardButton("⏸️ Pause", callback_data="music:pause")
@@ -219,49 +211,42 @@ def music_buttons(song=None):
             InlineKeyboardButton("📋 Queue", callback_data="music:queue"),
             InlineKeyboardButton("🎵 Play", callback_data="music:play")
         ],
-        [InlineKeyboardButton("🛑 End", callback_data="music:end")],
-        [InlineKeyboardButton("👑 Owner", url="https://t.me/THE_PANDEY_G")]
+        [
+            InlineKeyboardButton("🛑 End", callback_data="music:end")
+        ]
     ])
-    return InlineKeyboardMarkup(rows)
 
 
 def requester_tag(song):
     user_id = song.get("requester_id")
     name = song.get("requester_name") or "Unknown User"
     safe_name = html.escape(name)
+
     if user_id:
         return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+
     return safe_name
 
 
 async def send_now_playing(chat_id, song):
     title = html.escape(song.get("title", "Unknown Song"))
     requested_by = requester_tag(song)
+
     text = (
-        "🎵 <b>PANDEY MUSIC BOT</b> 🎵\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🎶 <b>NOW PLAYING</b>\n\n"
+        "🎵 <b>NOW PLAYING</b>\n\n"
         f"🎧 <b>Song:</b> {title}\n"
         f"👤 <b>Requested by:</b> {requested_by}\n\n"
-        "🎛 <b>Music Controls</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "👑 <b>Owner:</b> @THE_PANDEY_G"
+        "🎛 <b>Music Controls</b>"
     )
+
     sent = await bot.send_message(
         chat_id,
         text,
-        reply_markup=music_buttons(song),
+        reply_markup=music_buttons(),
         parse_mode=enums.ParseMode.HTML
     )
+
     now_playing_messages[chat_id] = sent
-
-
-async def delete_command_message(message, command_name):
-    """हर slash command को delete करने की कोशिश; group में Delete permission जरूरी है."""
-    try:
-        await message.delete()
-    except Exception as error:
-        print(f"⚠️ /{command_name} command delete नहीं हुआ: {error}")
 
 
 # ================= YOUTUBE SEARCH =================
@@ -330,14 +315,6 @@ def extract_audio_url(video_url):
             }
         }
     }
-
-    # SillyDev container में मौजूद Netscape-format cookies.txt का उपयोग करें।
-    cookies_file = Path("/home/container/cookies.txt")
-    if cookies_file.is_file() and cookies_file.stat().st_size > 0:
-        options["cookiefile"] = str(cookies_file)
-        print("🍪 YouTube cookies.txt enabled.")
-    else:
-        print("⚠️ cookies.txt नहीं मिली; YouTube verification आ सकता है।")
 
     deno_path = DENO_PATH or shutil.which("deno")
 
@@ -625,14 +602,6 @@ async def skip_music(chat_id):
 # ================= BUTTON CALLBACK =================
 
 async def music_callback(client, query):
-    if query.data.startswith("profile:"):
-        try:
-            target_id = int(query.data.split(":", 1)[1])
-            await query.answer(f"User ID: {target_id}", show_alert=True)
-        except Exception:
-            await query.answer("User ID उपलब्ध नहीं है।", show_alert=True)
-        return
-
     if not query.message:
         await query.answer("यह बटन उपलब्ध नहीं है।", show_alert=True)
         return
@@ -719,9 +688,8 @@ async def music_callback(client, query):
 # ================= START COMMAND =================
 
 async def start_command(client, message):
-    await delete_command_message(message, "start")
     await message.reply_text(
-        "🎵 <b>PANDEY MUSIC BOT</b> 🎵\n\n"
+        "🎵 Pandey Music Bot ऑनलाइन है!\n\n"
         "Commands:\n"
         "/play गाने का नाम\n"
         "/pause - Pause\n"
@@ -730,9 +698,7 @@ async def start_command(client, message):
         "/stop - Playback बंद\n"
         "/end - Playback समाप्त\n"
         "/queue - Queue देखें\n\n"
-        "🎛 नीचे दिए गए सभी buttons इस्तेमाल करें।\n\n👑 Owner: @THE_PANDEY_G",
-        reply_markup=music_buttons(),
-        parse_mode=enums.ParseMode.HTML
+        "🎛 Music Controls के लिए Now Playing Buttons इस्तेमाल करें।"
     )
 
 
@@ -741,7 +707,12 @@ async def start_command(client, message):
 async def play_command(client, message):
     chat_id = message.chat.id
 
-    await delete_command_message(message, "play")
+    # /play command message को chat से हटाने की कोशिश करें।
+    # Telegram में इसके लिए bot को group में message delete permission चाहिए।
+    try:
+        await message.delete()
+    except Exception as delete_error:
+        print(f"⚠️ /play command delete नहीं हो पाया: {delete_error}")
 
     print(
         f"🎵 PLAY COMMAND RECEIVED | "
@@ -840,7 +811,6 @@ async def play_command(client, message):
 # ================= PAUSE COMMAND =================
 
 async def pause_command(client, message):
-    await delete_command_message(message, "pause")
     chat_id = message.chat.id
 
     try:
@@ -859,7 +829,6 @@ async def pause_command(client, message):
 # ================= RESUME COMMAND =================
 
 async def resume_command(client, message):
-    await delete_command_message(message, "resume")
     chat_id = message.chat.id
 
     try:
@@ -878,7 +847,6 @@ async def resume_command(client, message):
 # ================= SKIP COMMAND =================
 
 async def skip_command(client, message):
-    await delete_command_message(message, "skip")
     chat_id = message.chat.id
 
     try:
@@ -902,7 +870,6 @@ async def skip_command(client, message):
 # ================= STOP COMMAND =================
 
 async def stop_command(client, message):
-    await delete_command_message(message, "stop")
     chat_id = message.chat.id
 
     try:
@@ -926,7 +893,6 @@ async def end_command(client, message):
 # ================= QUEUE COMMAND =================
 
 async def queue_command(client, message):
-    await delete_command_message(message, "queue")
     await message.reply_text(make_queue_text(message.chat.id))
 
 
@@ -954,7 +920,7 @@ async def main():
     )
 
     user = Client(
-        "Assistant",
+        "FreshLogin",
         api_id=API_ID,
         api_hash=API_HASH,
         workers=4
@@ -978,7 +944,7 @@ async def main():
         print("✅ Bot Client Started")
 
         await user.start()
-        print("✅ Assistant User Session Started")
+        print("✅ FreshLogin User Session Started")
 
         me = await user.get_me()
 
@@ -988,7 +954,7 @@ async def main():
 
         if me.is_bot:
             raise RuntimeError(
-                "Assistant.session में Normal User Account का session आवश्यक है।"
+                "FreshLogin में Normal User Account का session आवश्यक है।"
             )
 
         await calls.start()
@@ -1011,7 +977,7 @@ async def main():
         bot.add_handler(
             CallbackQueryHandler(
                 music_callback,
-                filters.regex(r"^(music|profile):")
+                filters.regex(r"^music:")
             )
         )
 
