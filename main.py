@@ -316,6 +316,15 @@ def extract_audio_url(video_url):
         }
     }
 
+    # Use a locally stored YouTube cookie export when available.
+    # Keep cookies.txt private; never print or upload its contents.
+    cookie_file = Path("/home/container/cookies.txt")
+    if cookie_file.is_file() and cookie_file.stat().st_size > 0:
+        options["cookiefile"] = str(cookie_file)
+        print("🍪 YouTube cookies file detected; yt-dlp will use it.")
+    else:
+        print("⚠️ cookies.txt नहीं मिली; YouTube verification आ सकता है।")
+
     deno_path = DENO_PATH or shutil.which("deno")
 
     if deno_path:
