@@ -10,7 +10,6 @@ import platform
 import zipfile
 import subprocess
 import stat
-import importlib.metadata
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -33,7 +32,7 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 AUTO_INSTALL_DENO = os.getenv("AUTO_INSTALL_DENO", "0").strip().lower() in ("1", "true", "yes")
-MAX_QUEUE_SIZE = max(1, int(os.getenv("MAX_QUEUE_SIZE", "20")))
+MAX_QUEUE_SIZE = max(1, int(os.getenv("MAX_QUEUE_SIZE", "10")))
 
 DENO_DIR = Path("/home/container/.deno-runtime").resolve()
 DENO_BIN = DENO_DIR / "deno"
@@ -256,8 +255,6 @@ def search_youtube(query):
     if not YOUTUBE_API_KEY:
         raise ValueError("YOUTUBE_API_KEY .env में नहीं मिली।")
 
-    started = time.perf_counter()
-
     response = http.get(
         "https://www.googleapis.com/youtube/v3/search",
         params={
@@ -273,11 +270,6 @@ def search_youtube(query):
     response.raise_for_status()
     items = response.json().get("items", [])
 
-    print(
-        f"🔎 YouTube Search Time: "
-        f"{time.perf_counter() - started:.2f}s"
-    )
-
     if not items:
         return None
 
@@ -291,90 +283,9 @@ def search_youtube(query):
     }
 
 
-# ================= RUNTIME DIAGNOSTICS =================
-
-def _read_text_file(path):
-    try:
-        return Path(path).read_text(errors="replace").strip()
-    except Exception:
-        return "unavailable"
-
-def _memory_diagnostics():
-    """Host/cgroup memory details; never reads or prints secrets."""
-    print("\n========== SYSTEM DIAGNOSTICS ==========")
-    print(f"🖥️ OS/Arch: {platform.platform()} | {platform.machine()}")
-    print(f"🐍 Python: {platform.python_version()}")
-    print(f"📦 yt-dlp: {getattr(yt_dlp.version, '__version__', 'unknown')}")
-    for package in ("yt-dlp-ejs", "pyrogram", "py-tgcalls", "ntgcalls"):
-        try:
-            print(f"📦 {package}: {importlib.metadata.version(package)}")
-        except Exception:
-            print(f"📦 {package}: not installed / metadata unavailable")
-
-    meminfo = _read_text_file('/proc/meminfo')
-    if meminfo != "unavailable":
-        for line in meminfo.splitlines():
-            if line.startswith(("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:")):
-                print(f"🧠 {line}")
-
-    process_status = _read_text_file('/proc/self/status')
-    if process_status != "unavailable":
-        for line in process_status.splitlines():
-            if line.startswith(("VmRSS:", "VmHWM:", "Threads:")):
-                print(f"🧩 Python process {line}")
-
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path:
-        try:
-            ffmpeg_result = subprocess.run(
-                [ffmpeg_path, "-version"], capture_output=True, text=True, timeout=5
-            )
-            first_line = (ffmpeg_result.stdout or ffmpeg_result.stderr).splitlines()
-            print(f"🎞️ FFmpeg: {first_line[0] if first_line else ffmpeg_path}")
-        except Exception as error:
-            print(f"⚠️ FFmpeg check failed: {type(error).__name__}: {error}")
-    else:
-        print("🔴 FFmpeg: NOT FOUND in PATH")
-
-    for cgroup_file in (
-        '/sys/fs/cgroup/memory.max',
-        '/sys/fs/cgroup/memory.current',
-        '/sys/fs/cgroup/memory.events',
-        '/sys/fs/cgroup/memory/memory.limit_in_bytes',
-        '/sys/fs/cgroup/memory/memory.usage_in_bytes',
-    ):
-        value = _read_text_file(cgroup_file)
-        if value != "unavailable":
-            print(f"📊 {cgroup_file}: {value.replace(chr(10), '; ')}")
-
-    if DENO_PATH:
-        try:
-            result = subprocess.run(
-                [str(DENO_PATH), '--version'], capture_output=True, text=True, timeout=8
-            )
-            print(f"🟢 Deno check returncode: {result.returncode}")
-            print(f"🟢 Deno version: {(result.stdout or result.stderr).strip()[:500]}")
-        except Exception as error:
-            print(f"🔴 Deno check failed: {type(error).__name__}: {error}")
-    else:
-        print("🔴 Deno path: NOT FOUND")
-
-    cookie_path = Path('/home/container/cookies.txt')
-    if cookie_path.is_file():
-        try:
-            print(f"🍪 cookies.txt: present | bytes={cookie_path.stat().st_size} | readable={os.access(cookie_path, os.R_OK)}")
-        except Exception:
-            print("🍪 cookies.txt: present | metadata unavailable")
-    else:
-        print("🍪 cookies.txt: MISSING")
-    print("========== END DIAGNOSTICS ==========\n")
-
-
 # ================= AUDIO EXTRACTION =================
 
 def extract_audio_url(video_url):
-    started = time.perf_counter()
-
     options = {
         # पहले सर्वोत्तम audio, फिर video+audio वाले सामान्य format को fallback दें।
         # Protocol को force नहीं करते: इससे YouTube के उपलब्ध audio formats नहीं छूटेंगे।
@@ -426,11 +337,7 @@ def extract_audio_url(video_url):
     except yt_dlp.utils.DownloadError as error:
         error_text = str(error)
         lowered = error_text.casefold()
-        print("\n🧪 YOUTUBE EXTRACTION FAILURE DIAGNOSTICS")
-        print(f"🔎 URL: {video_url}")
-        print(f"🔎 yt-dlp error: {error_text[:1200]}")
-        print(f"🔎 Deno path: {deno_path or 'NOT FOUND'}")
-        _memory_diagnostics()
+        print(f"❌ YouTube extraction: {error_text[:500]}")
 
         if "sign in to confirm you're not a bot" in lowered:
             raise RuntimeError(
@@ -475,11 +382,6 @@ def extract_audio_url(video_url):
     if not audio_url:
         raise RuntimeError("Direct Audio URL उपलब्ध नहीं है।")
 
-    print(
-        f"⚡ Audio Extraction Time: "
-        f"{time.perf_counter() - started:.2f}s"
-    )
-
     return audio_url
 
 
@@ -519,7 +421,6 @@ async def play_next(chat_id):
     song = queues[chat_id].popleft()
 
     try:
-        started = time.perf_counter()
         print(f"🎧 Trying: {song['title']}")
 
         # Preload बंद है: audio तभी extract होगा जब गाना चलने की बारी आएगी।
@@ -527,13 +428,10 @@ async def play_next(chat_id):
             audio_input = await asyncio.to_thread(
                 extract_audio_url, song["url"]
             )
-        vc_started = time.perf_counter()
 
         # पहली बार connect करेगा; active VC में stream replace करेगा।
         await start_song_in_call(chat_id, song, audio_input)
 
-        print(f"📡 VC Startup/Stream Switch Time: {time.perf_counter() - vc_started:.2f}s")
-        print(f"🎵 Total Playback Start Time: {time.perf_counter() - started:.2f}s")
         return True
 
     except Exception as error:
@@ -835,7 +733,6 @@ async def play_command(client, message):
     )
 
     try:
-        started = time.perf_counter()
         song = await asyncio.to_thread(search_youtube, query)
 
         if not song:
@@ -852,11 +749,6 @@ async def play_command(client, message):
         else:
             song["requester_id"] = None
             song["requester_name"] = "Group Admin"
-
-        print(
-            f"🔎 Total Search Time: "
-            f"{time.perf_counter() - started:.2f}s"
-        )
 
         if len(queues[chat_id]) >= MAX_QUEUE_SIZE:
             await status.edit_text(
@@ -1014,21 +906,19 @@ async def main():
     else:
         print("⚠️ Deno उपलब्ध नहीं है; yt-dlp fallback mode में चलेगा।")
 
-    _memory_diagnostics()
-
     bot = Client(
         "PandeyMusicBot",
         api_id=API_ID,
         api_hash=API_HASH,
         bot_token=BOT_TOKEN,
-        workers=2
+        workers=1
     )
 
     user = Client(
         "FreshLogin",
         api_id=API_ID,
         api_hash=API_HASH,
-        workers=2
+        workers=1
     )
 
     calls = PyTgCalls(user)
@@ -1053,9 +943,6 @@ async def main():
 
         me = await user.get_me()
 
-        print(f"👤 Account Name: {me.first_name}")
-        print(f"🆔 Account ID: {me.id}")
-        print(f"🤖 Is Bot Account?: {me.is_bot}")
 
         if me.is_bot:
             raise RuntimeError(
@@ -1090,10 +977,7 @@ async def main():
         print("🎵 Pandey Music Bot Online!")
         print("🌐 YouTube Search Enabled!")
         print("🎛 Inline Music Controls Enabled!")
-        print("🚫 Queue Preload Disabled!")
-        print("🧠 Single Audio Extraction Mode Enabled!")
-        print(f"📋 Maximum Queue Per Group: {MAX_QUEUE_SIZE}")
-        print("⚙️ HIGH Audio Quality / Reduced Worker Threads Enabled!")
+        print("⚙️ HIGH Audio Quality / Low Worker Mode Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
 
         await asyncio.Event().wait()
