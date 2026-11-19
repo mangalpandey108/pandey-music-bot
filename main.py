@@ -57,12 +57,7 @@ def setup_deno():
         print(f"✅ System Deno Found: {existing}")
         return existing
 
-    # Resource-friendly default: do not download a runtime at startup.
-    # Set AUTO_INSTALL_DENO=1 in .env to enable the original installer.
-    if not AUTO_INSTALL_DENO:
-        print("ℹ️ Deno auto-install बंद है; जरूरत हो तो .env में AUTO_INSTALL_DENO=1 करें।")
-        return None
-
+    # पहले से मौजूद local Deno को हमेशा इस्तेमाल करें।
     if DENO_BIN.exists():
         try:
             os.chmod(DENO_BIN, 0o755)
@@ -72,13 +67,16 @@ def setup_deno():
                 text=True,
                 timeout=15
             )
-
             if result.returncode == 0:
                 print("✅ पहले से डाउनलोड किया हुआ Deno मिला।")
                 return str(DENO_BIN)
-
         except Exception as error:
             print(f"⚠️ Existing Deno इस्तेमाल नहीं हो सका: {error}")
+
+    # जरूरत पड़ने पर ही नया Deno डाउनलोड करें।
+    if not AUTO_INSTALL_DENO:
+        print("ℹ️ Deno नहीं मिला। .env में AUTO_INSTALL_DENO=1 करें या Deno install करें।")
+        return None
 
     machine = platform.machine().lower()
 
@@ -314,6 +312,14 @@ def extract_audio_url(video_url):
             }
         }
     }
+
+    # SillyDev container में मौजूद Netscape-format cookies.txt का उपयोग करें।
+    cookies_file = Path("/home/container/cookies.txt")
+    if cookies_file.is_file() and cookies_file.stat().st_size > 0:
+        options["cookiefile"] = str(cookies_file)
+        print("🍪 YouTube cookies.txt enabled.")
+    else:
+        print("⚠️ cookies.txt नहीं मिली; YouTube verification आ सकता है।")
 
     deno_path = DENO_PATH or shutil.which("deno")
 
@@ -919,7 +925,7 @@ async def main():
     )
 
     user = Client(
-        "FreshLogin",
+        "Assistant",
         api_id=API_ID,
         api_hash=API_HASH,
         workers=4
@@ -943,7 +949,7 @@ async def main():
         print("✅ Bot Client Started")
 
         await user.start()
-        print("✅ FreshLogin User Session Started")
+        print("✅ Assistant User Session Started")
 
         me = await user.get_me()
 
@@ -953,7 +959,7 @@ async def main():
 
         if me.is_bot:
             raise RuntimeError(
-                "FreshLogin में Normal User Account का session आवश्यक है।"
+                "Assistant.session में Normal User Account का session आवश्यक है।"
             )
 
         await calls.start()
