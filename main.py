@@ -325,11 +325,11 @@ def diagnose_youtube_cookies():
 
 
 def _resolve_with_ytdlp(video_url):
-    """Try YouTube clients that may expose formats without a JS runtime.
+    """Try current yt-dlp YouTube clients without spawning a JS runtime.
 
-    The host has a tight memory limit, so Deno/Node stay disabled.  The TV
-    client and Safari HLS client are tried before cookie-authenticated web
-    clients; Android is retained only as a no-cookie fallback.
+    This host has a 294 MB memory ceiling, so Deno/Node remain disabled.
+    Client availability changes on YouTube; each profile is isolated so one
+    blocked client cannot prevent the remaining profiles from being tried.
     """
     try:
         import yt_dlp
@@ -341,7 +341,7 @@ def _resolve_with_ytdlp(video_url):
     cookie_path = _youtube_cookie_path()
     has_cookies = cookie_path.is_file() and cookie_path.stat().st_size > 0
     if has_cookies:
-        print("🍪 YouTube cookies enabled for supported yt-dlp profiles.")
+        print("🍪 YouTube cookies enabled only for clients that support account cookies.")
     else:
         print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
@@ -352,9 +352,9 @@ def _resolve_with_ytdlp(video_url):
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
-        # Keep JS challenge runtimes disabled for the 294 MB container.
+        # Deno/Node can push this 294 MB container into OOM.
         "js_runtimes": {},
-        "socket_timeout": 8,
+        "socket_timeout": 7,
         "retries": 1,
         "extractor_retries": 1,
         "fragment_retries": 1,
@@ -364,32 +364,36 @@ def _resolve_with_ytdlp(video_url):
 
     profiles = []
 
-    # TV client does not require a PO token for its formats in current yt-dlp.
-    tv_options = dict(base_options)
-    tv_options["extractor_args"] = {"youtube": {"player_client": ["tv"]}}
-    profiles.append(("tv", tv_options))
+    # These clients do not use the user's account cookies. Trying them first
+    # avoids accidentally triggering TV-client DRM behavior with logged-in cookies.
+    for profile_name in ("tv", "tv_downgraded", "tv_samsung", "tv_simply"):
+        options = dict(base_options)
+        options["extractor_args"] = {
+            "youtube": {"player_client": [profile_name]}
+        }
+        profiles.append((profile_name, options))
 
-    # Safari HLS can expose streams when the regular web client is SABR-only.
-    safari_options = dict(base_options)
-    safari_options["extractor_args"] = {"youtube": {"player_client": ["web_safari"]}}
-    if has_cookies:
-        safari_options["cookiefile"] = str(cookie_path)
-    profiles.append(("web_safari", safari_options))
+    # Safari can return HLS formats; recent YouTube changes may restrict them
+    # to trusted/logged-in sessions, so pass cookies only to supported clients.
+    for profile_name in ("web_safari", "web_embedded", "web_music", "web"):
+        options = dict(base_options)
+        options["extractor_args"] = {
+            "youtube": {"player_client": [profile_name]}
+        }
+        if has_cookies:
+            options["cookiefile"] = str(cookie_path)
+        profiles.append((profile_name, options))
 
-    # Embedded client can work for videos that permit embedding; cookies are
-    # passed when available, but this profile is not guaranteed for all videos.
-    embedded_options = dict(base_options)
-    embedded_options["extractor_args"] = {"youtube": {"player_client": ["web_embedded"]}}
-    if has_cookies:
-        embedded_options["cookiefile"] = str(cookie_path)
-    profiles.append(("web_embedded", embedded_options))
+    # Mobile clients do not accept account cookies. They are best-effort only:
+    # current YouTube deployments may require per-video PO tokens for them.
+    for profile_name in ("android_vr", "ios", "mweb", "android"):
+        options = dict(base_options)
+        options["extractor_args"] = {
+            "youtube": {"player_client": [profile_name]}
+        }
+        profiles.append((profile_name, options))
 
-    # Android does not support account-cookie authentication in yt-dlp.
-    android_options = dict(base_options)
-    android_options["extractor_args"] = {"youtube": {"player_client": ["android"]}}
-    profiles.append(("android", android_options))
-
-    # Last attempt: yt-dlp's own current client selection with the cookie file.
+    # Keep yt-dlp's own client selection as the final compatibility attempt.
     default_options = dict(base_options)
     if has_cookies:
         default_options["cookiefile"] = str(cookie_path)
@@ -398,6 +402,7 @@ def _resolve_with_ytdlp(video_url):
     info = None
     profile_errors = []
     for profile_name, profile_options in profiles:
+        print(f"🔄 yt-dlp profile शुरू: {profile_name}")
         try:
             with yt_dlp.YoutubeDL(profile_options) as ydl:
                 candidate = ydl.extract_info(video_url, download=False)
@@ -408,9 +413,8 @@ def _resolve_with_ytdlp(video_url):
             profile_errors.append(f"{profile_name}: no video formats returned")
             print(f"⚠️ yt-dlp profile failed: {profile_name} (no formats)")
         except Exception as error:
-            # Exception text is useful for distinguishing LOGIN_REQUIRED,
-            # PO-token and no-format failures. Never print cookie values.
-            detail = str(error).replace("\n", " ")[:180]
+            # Keep diagnostics useful without exposing cookie contents.
+            detail = " ".join(str(error).split())[:160]
             profile_errors.append(f"{profile_name}: {type(error).__name__}: {detail}")
             print(f"⚠️ yt-dlp profile failed: {profile_name}: {type(error).__name__}: {detail}")
 
