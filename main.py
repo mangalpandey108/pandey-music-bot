@@ -171,10 +171,19 @@ def search_youtube(query):
 # Public Piped API endpoints. Override in .env with comma-separated URLs.
 # Public instances can go offline or rate-limit requests; fallbacks are tried.
 DEFAULT_PIPED_APIS = (
-    "https://pipedapi.ducks.party",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.qwik.space",
-    "https://api.piped.minionflo.net",
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.nosebs.ru",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.owo.si",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.orangenet.cc",
+    "https://piped-api.codespace.cz",
+    "https://pipedapi.reallyaweso.me",
 )
 
 def _youtube_video_id(video_url):
@@ -212,16 +221,18 @@ def extract_audio_url(video_url):
             response = http.get(
                 f"{api_base}/streams/{video_id}",
                 headers=headers,
-                timeout=(4, 9),
+                timeout=(3, 7),
             )
             response.raise_for_status()
             data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("API response JSON object नहीं है")
             streams = data.get("audioStreams") or []
             usable = []
             for item in streams:
                 stream_url = item.get("url")
                 mime = (item.get("mimeType") or item.get("contentType") or "").lower()
-                if not stream_url or (mime and "audio" not in mime):
+                if not stream_url or item.get("videoOnly") is True or (mime and "audio" not in mime):
                     continue
                 try:
                     bitrate = int(item.get("bitrate") or item.get("audioBitrate") or 0)
@@ -235,7 +246,7 @@ def extract_audio_url(video_url):
                 return usable[0][1]
             errors.append(f"{api_base}: audioStreams खाली")
         except Exception as error:
-            errors.append(f"{api_base}: {type(error).__name__}: {str(error)[:100]}")
+            errors.append(f"{api_base}: {type(error).__name__}: {str(error)[:90]}")
             print(f"⚠️ Resolver failed ({api_base}): {type(error).__name__}")
 
     raise RuntimeError(
