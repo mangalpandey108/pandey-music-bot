@@ -166,23 +166,14 @@ def search_youtube(query):
     }
 
 
-# ================= AUDIO EXTRACTION (NO DENO / NO YT-DLP) =================
+# ================= AUDIO EXTRACTION: PIPED + LOW-RAM YT-DLP FALLBACK =================
 
-# Public Piped API endpoints. Override in .env with comma-separated URLs.
-# Public instances can go offline or rate-limit requests; fallbacks are tried.
+# Public Piped servers are best-effort only. Set PIPED_API_INSTANCES in .env
+# to override this short list (comma-separated URLs).
 DEFAULT_PIPED_APIS = (
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
-    "https://pipedapi-libre.kavin.rocks",
-    "https://piped-api.privacy.com.de",
     "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
-    "https://pipedapi.drgns.space",
-    "https://pipedapi.owo.si",
-    "https://pipedapi.darkness.services",
+    "https://pipedapi.leptons.xyz",
     "https://pipedapi.orangenet.cc",
-    "https://piped-api.codespace.cz",
     "https://pipedapi.reallyaweso.me",
 )
 
@@ -199,16 +190,12 @@ def _youtube_video_id(video_url):
         return parts[1]
     return ""
 
-def extract_audio_url(video_url):
-    video_id = _youtube_video_id(video_url)
-    if not video_id:
-        raise RuntimeError("YouTube video ID समझ नहीं आया।")
-
+def _resolve_with_piped(video_id):
     configured = os.getenv("PIPED_API_INSTANCES", "").strip()
-    if configured:
-        api_instances = [x.strip().rstrip("/") for x in configured.split(",") if x.strip()]
-    else:
-        api_instances = list(DEFAULT_PIPED_APIS)
+    api_instances = (
+        [x.strip().rstrip("/") for x in configured.split(",") if x.strip()]
+        if configured else list(DEFAULT_PIPED_APIS)
+    )
 
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
@@ -221,18 +208,23 @@ def extract_audio_url(video_url):
             response = http.get(
                 f"{api_base}/streams/{video_id}",
                 headers=headers,
-                timeout=(3, 7),
+                timeout=(2, 4),
             )
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
-                raise ValueError("API response JSON object नहीं है")
+                raise ValueError("Invalid JSON response")
+
             streams = data.get("audioStreams") or []
             usable = []
             for item in streams:
+                if not isinstance(item, dict):
+                    continue
                 stream_url = item.get("url")
                 mime = (item.get("mimeType") or item.get("contentType") or "").lower()
-                if not stream_url or item.get("videoOnly") is True or (mime and "audio" not in mime):
+                if not stream_url or item.get("videoOnly") is True:
+                    continue
+                if mime and "audio" not in mime:
                     continue
                 try:
                     bitrate = int(item.get("bitrate") or item.get("audioBitrate") or 0)
@@ -241,18 +233,100 @@ def extract_audio_url(video_url):
                 usable.append((bitrate, stream_url))
 
             if usable:
-                usable.sort(key=lambda x: x[0], reverse=True)
-                print(f"✅ Direct audio URL received from Piped: {api_base}")
-                return usable[0][1]
-            errors.append(f"{api_base}: audioStreams खाली")
-        except Exception as error:
-            errors.append(f"{api_base}: {type(error).__name__}: {str(error)[:90]}")
-            print(f"⚠️ Resolver failed ({api_base}): {type(error).__name__}")
+                usable.sort(key=lambda item: item[0], reverse=True)
+                print(f"✅ Audio URL मिला: Piped ({api_base})")
+                return usable[0][1], errors
 
-    raise RuntimeError(
-        "YouTube direct audio stream नहीं मिला। सभी lightweight resolver "
-        "instances असफल हुए। " + " | ".join(errors[:4])
-    )
+            errors.append(f"{api_base}: no audio stream")
+        except Exception as error:
+            errors.append(f"{api_base}: {type(error).__name__}")
+            print(f"⚠️ Piped failed ({api_base}): {type(error).__name__}")
+
+    return None, errors
+
+def _resolve_with_ytdlp(video_url):
+    try:
+        import yt_dlp
+    except ImportError as error:
+        raise RuntimeError(
+            "yt-dlp installed नहीं है। requirements.txt में yt-dlp जोड़ें।"
+        ) from error
+
+    # Disable all JS runtimes: this prevents yt-dlp from launching Deno/Node.
+    # This is a lower-memory best-effort mode; YouTube may reject some videos
+    # if its current player challenge requires a JavaScript runtime.
+    options = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": False,
+        "js_runtimes": {},
+        "socket_timeout": 8,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
+        "concurrent_fragment_downloads": 1,
+        "overwrites": False,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+    if not isinstance(info, dict):
+        raise RuntimeError("yt-dlp से video जानकारी नहीं मिली।")
+
+    # Prefer audio-only formats, with the highest available audio bitrate.
+    formats = info.get("formats") or []
+    audio_formats = []
+    for item in formats:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        if item.get("vcodec") not in (None, "none"):
+            continue
+        if item.get("acodec") in (None, "none"):
+            continue
+        audio_formats.append(item)
+
+    if audio_formats:
+        audio_formats.sort(
+            key=lambda item: (
+                item.get("abr") or 0,
+                item.get("asr") or 0,
+                item.get("tbr") or 0,
+            ),
+            reverse=True,
+        )
+        print("✅ Audio URL मिला: yt-dlp fallback (JavaScript runtime disabled)")
+        return audio_formats[0]["url"]
+
+    # Some extractors return a single selected format at the top level.
+    direct_url = info.get("url")
+    if direct_url and info.get("acodec") not in (None, "none"):
+        print("✅ Audio URL मिला: yt-dlp selected format")
+        return direct_url
+
+    raise RuntimeError("yt-dlp को playable audio-only format नहीं मिला।")
+
+def extract_audio_url(video_url):
+    video_id = _youtube_video_id(video_url)
+    if not video_id:
+        raise RuntimeError("YouTube video ID समझ नहीं आया।")
+
+    piped_url, piped_errors = _resolve_with_piped(video_id)
+    if piped_url:
+        return piped_url
+
+    print("↪️ सभी Piped attempts असफल; अब yt-dlp low-memory fallback...")
+    try:
+        return _resolve_with_ytdlp(video_url)
+    except Exception as error:
+        summary = " | ".join(piped_errors[:4])
+        raise RuntimeError(
+            "Piped और yt-dlp दोनों resolver असफल हुए। "
+            f"Piped: {summary}. yt-dlp: {type(error).__name__}: {str(error)[:220]}"
+        ) from error
 
 # ================= PLAYBACK =================
 
@@ -773,7 +847,7 @@ async def main():
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
 
-    print("🪶 LOW-RAM MODE: Deno और yt-dlp बंद; external direct-audio resolver enabled.")
+    print("🪶 LOW-RAM MODE: Piped first, yt-dlp fallback; Deno/Node JS runtime disabled.")
 
     bot = Client(
         "PandeyMusicBot",
@@ -845,7 +919,7 @@ async def main():
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot Online!")
         print("🌐 YouTube Search Enabled!")
-        print("🧠 Deno/yt-dlp process नहीं चलेगा; Piped resolver इस्तेमाल होगा।")
+        print("🧠 Piped resolver + yt-dlp fallback enabled; Deno/Node child process disabled.")
         print("🎛 Inline Music Controls Enabled!")
         print("⚙️ HIGH Audio Quality / Low Worker Mode Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
