@@ -252,9 +252,17 @@ def _resolve_with_ytdlp(video_url):
             "yt-dlp installed नहीं है। requirements.txt में yt-dlp जोड़ें।"
         ) from error
 
-    # Disable all JS runtimes: this prevents yt-dlp from launching Deno/Node.
-    # This is a lower-memory best-effort mode; YouTube may reject some videos
-    # if its current player challenge requires a JavaScript runtime.
+    # Use the server's existing cookies.txt when available. This helps with
+    # YouTube's "Sign in to confirm you're not a bot" gate. Never print cookie
+    # contents or copy them into logs.
+    cookie_env = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
+    if cookie_env:
+        cookie_path = Path(cookie_env).expanduser()
+        if not cookie_path.is_absolute():
+            cookie_path = Path(__file__).resolve().parent / cookie_path
+    else:
+        cookie_path = Path(__file__).resolve().parent / "cookies.txt"
+
     options = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -262,6 +270,8 @@ def _resolve_with_ytdlp(video_url):
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
+        # Keep Deno/Node disabled to protect the small memory limit.
+        # Cookies are passed to yt-dlp when a local cookie file exists.
         "js_runtimes": {},
         "socket_timeout": 8,
         "retries": 1,
@@ -270,6 +280,11 @@ def _resolve_with_ytdlp(video_url):
         "concurrent_fragment_downloads": 1,
         "overwrites": False,
     }
+    if cookie_path.is_file() and cookie_path.stat().st_size > 0:
+        options["cookiefile"] = str(cookie_path)
+        print("🍪 YouTube cookies enabled for yt-dlp fallback.")
+    else:
+        print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(video_url, download=False)
