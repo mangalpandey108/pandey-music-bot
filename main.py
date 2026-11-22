@@ -5,6 +5,9 @@ import time
 import requests
 import shutil
 import html
+import sys
+import subprocess
+import zipfile
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -166,6 +169,149 @@ def search_youtube(query):
     }
 
 
+# ================= LOW-RAM BGUTIL PO TOKEN PROVIDER =================
+
+# Script mode avoids keeping a second HTTP server alive beside this bot.
+# Deno starts only when yt-dlp requests a PO token.
+BGUTIL_VERSION = "2.0.2"
+BGUTIL_HOME = Path(__file__).resolve().parent / ".cache" / "bgutil-ytdlp-pot-provider"
+BGUTIL_SERVER_DIR = BGUTIL_HOME / "server"
+BGUTIL_SETUP_OK = False
+DENO_EXECUTABLE = None
+
+
+def _find_deno_executable():
+    configured = os.getenv("DENO_PATH", "").strip()
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        Path("/home/container/.deno-runtime/deno"),
+        Path("/home/container/.deno/bin/deno"),
+        Path.home() / ".deno" / "bin" / "deno",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which("deno")
+
+
+def _download_bgutil_source():
+    """Fetch the pinned provider source without requiring git on the host."""
+    if (BGUTIL_SERVER_DIR / "src" / "main.ts").is_file():
+        return True
+
+    BGUTIL_HOME.parent.mkdir(parents=True, exist_ok=True)
+    archive_url = (
+        "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/"
+        f"archive/refs/tags/{BGUTIL_VERSION}.zip"
+    )
+    temp_zip = BGUTIL_HOME.parent / f"bgutil-{BGUTIL_VERSION}.zip"
+    temp_extract = BGUTIL_HOME.parent / "bgutil-extract"
+
+    try:
+        response = http.get(archive_url, timeout=(10, 60), stream=True)
+        response.raise_for_status()
+        with open(temp_zip, "wb") as output:
+            for chunk in response.iter_content(chunk_size=128 * 1024):
+                if chunk:
+                    output.write(chunk)
+
+        shutil.rmtree(temp_extract, ignore_errors=True)
+        temp_extract.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(temp_zip) as archive:
+            root_prefix = f"bgutil-ytdlp-pot-provider-{BGUTIL_VERSION}/"
+            for member in archive.infolist():
+                if not member.filename.startswith(root_prefix):
+                    continue
+                relative = member.filename[len(root_prefix):]
+                if not relative:
+                    continue
+                target = (temp_extract / relative).resolve()
+                if temp_extract.resolve() not in target.parents and target != temp_extract.resolve():
+                    continue
+                if member.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+
+        if not (temp_extract / "server" / "src" / "main.ts").is_file():
+            raise RuntimeError("provider archive में server/src/main.ts नहीं मिली")
+        shutil.rmtree(BGUTIL_HOME, ignore_errors=True)
+        temp_extract.rename(BGUTIL_HOME)
+        return True
+    except Exception as error:
+        print(f"⚠️ BgUtil source setup failed: {type(error).__name__}: {error}")
+        return False
+    finally:
+        try:
+            temp_zip.unlink(missing_ok=True)
+        except Exception:
+            pass
+        shutil.rmtree(temp_extract, ignore_errors=True)
+
+
+def ensure_bgutil_provider():
+    """Install the yt-dlp plugin and Deno script dependencies once."""
+    global BGUTIL_SETUP_OK, DENO_EXECUTABLE
+    DENO_EXECUTABLE = _find_deno_executable()
+    if not DENO_EXECUTABLE:
+        print("⚠️ BgUtil PO token setup skipped: Deno executable नहीं मिला।")
+        print("ℹ️ DENO_PATH env में Deno binary का path दे सकते हैं।")
+        return False
+
+    os.environ["PATH"] = str(Path(DENO_EXECUTABLE).resolve().parent) + os.pathsep + os.environ.get("PATH", "")
+    os.environ["DENO_NO_UPDATE_CHECK"] = "1"
+    os.environ["DENO_NO_PROMPT"] = "1"
+
+    try:
+        import importlib.metadata
+        try:
+            installed_version = importlib.metadata.version("bgutil-ytdlp-pot-provider")
+        except importlib.metadata.PackageNotFoundError:
+            installed_version = ""
+
+        if installed_version != BGUTIL_VERSION:
+            print(f"📦 BgUtil yt-dlp plugin {BGUTIL_VERSION} install हो रहा है...")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                 "--no-cache-dir", f"bgutil-ytdlp-pot-provider=={BGUTIL_VERSION}"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=180, check=False,
+            )
+            if result.returncode != 0:
+                print("⚠️ BgUtil plugin pip install असफल:")
+                print((result.stdout or "")[-1800:])
+                return False
+
+        if not _download_bgutil_source():
+            return False
+
+        marker = BGUTIL_SERVER_DIR / ".deno-installed-2.0.2"
+        if not marker.is_file():
+            print("🧩 BgUtil Deno script dependencies पहली बार install हो रही हैं...")
+            result = subprocess.run(
+                [DENO_EXECUTABLE, "install", "--allow-scripts=npm:canvas", "--frozen"],
+                cwd=str(BGUTIL_SERVER_DIR), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=300, check=False,
+            )
+            if result.returncode != 0:
+                print("⚠️ BgUtil Deno dependency install असफल:")
+                print((result.stdout or "")[-2200:])
+                return False
+            marker.write_text("ok\n", encoding="utf-8")
+
+        BGUTIL_SETUP_OK = True
+        print(f"✅ BgUtil PO Token Provider तैयार: script mode / Deno {BGUTIL_VERSION}")
+        print("🪶 HTTP sidecar बंद है; token की जरूरत पर ही Deno child process चलेगा।")
+        return True
+    except subprocess.TimeoutExpired:
+        print("⚠️ BgUtil setup timeout: install पूरा नहीं हुआ; bot सामान्य fallback से चलेगा।")
+    except Exception as error:
+        print(f"⚠️ BgUtil setup error: {type(error).__name__}: {error}")
+    return False
+
+
 # ================= AUDIO EXTRACTION: PIPED + LOW-RAM YT-DLP FALLBACK =================
 
 # Public Piped servers are best-effort only. Set PIPED_API_INSTANCES in .env
@@ -324,52 +470,33 @@ def diagnose_youtube_cookies():
         print("ℹ️ File structure पढ़ने योग्य है; network/IP block की वजह से acceptance जाँची नहीं जा सकी।")
 
 
-def _low_memory_deno_path():
-    """Create a tiny Deno launcher that caps V8 heap for this 294 MB host.
+class _YTDLPDiagnosticLogger:
+    """Print only PO-token diagnostics; keep normal yt-dlp output quiet."""
+    def debug(self, message):
+        lowered = str(message).lower()
+        if "[pot" in lowered or "generating a " in lowered:
+            print(f"🔐 yt-dlp: {message}")
 
-    yt-dlp's Python API accepts a runtime path but not runtime CLI arguments.
-    The wrapper inserts the V8 limit as a separate argument (not one combined
-    flag string), avoiding the malformed-flag error seen in earlier logs.
-    """
-    candidates = [
-        Path(__file__).resolve().parent / ".deno-runtime" / "deno",
-        Path.home() / ".deno" / "bin" / "deno",
-    ]
-    found = next((item for item in candidates if item.is_file()), None)
-    if found is None:
-        located = shutil.which("deno")
-        found = Path(located) if located else None
-    if found is None:
-        return None
+    def warning(self, message):
+        lowered = str(message).lower()
+        if "[pot" in lowered or "token" in lowered:
+            print(f"⚠️ yt-dlp: {message}")
 
-    wrapper = Path(__file__).resolve().parent / ".deno-lowmem-wrapper"
-    try:
-        # The V8 flag is a single argument to Deno; never combine multiple
-        # V8 flags with spaces. 64 MB is deliberately conservative.
-        wrapper.write_text(
-            "#!/bin/sh\n"
-            f"exec {str(found)!r} --v8-flags=--max-old-space-size=64 \"$@\"\n",
-            encoding="utf-8",
-        )
-        wrapper.chmod(0o700)
-        return str(wrapper)
-    except OSError as error:
-        print(f"⚠️ Low-RAM Deno wrapper नहीं बन पाया: {type(error).__name__}")
-        return str(found)
+    def error(self, message):
+        print(f"❌ yt-dlp: {message}")
 
 
 def _resolve_with_ytdlp(video_url):
-    """Resolve YouTube audio with one JS-enabled Safari attempt, then fallbacks.
+    """Try low-memory clients, including mweb with BgUtil PO tokens.
 
-    YouTube currently needs EJS JavaScript challenge solving for some clients.
-    Only the web_safari/HLS attempt gets a memory-capped Deno runtime; this
-    avoids launching Deno for every client profile on the 294 MB container.
+    Deno is used only for the mweb PO-token attempt; no provider server stays
+    running in the background. Other clients keep JS runtimes disabled.
     """
     try:
         import yt_dlp
     except ImportError as error:
         raise RuntimeError(
-            "yt-dlp installed नहीं है। requirements.txt में yt-dlp[default] जोड़ें।"
+            "yt-dlp installed नहीं है। requirements.txt में yt-dlp जोड़ें।"
         ) from error
 
     cookie_path = _youtube_cookie_path()
@@ -384,8 +511,12 @@ def _resolve_with_ytdlp(video_url):
         "noplaylist": True,
         "skip_download": True,
         "quiet": True,
+        "verbose": True,
         "no_warnings": True,
+        "logger": _YTDLPDiagnosticLogger(),
         "cachedir": False,
+        # Default clients stay JS-runtime-free; mweb opts into Deno separately.
+        "js_runtimes": {},
         "socket_timeout": 8,
         "retries": 1,
         "extractor_retries": 1,
@@ -395,39 +526,55 @@ def _resolve_with_ytdlp(video_url):
     }
 
     profiles = []
-    deno_wrapper = _low_memory_deno_path()
-    if deno_wrapper:
-        safari_options = dict(base_options)
-        safari_options["extractor_args"] = {
-            "youtube": {"player_client": ["web_safari"]}
-        }
-        safari_options["js_runtimes"] = {"deno": {"path": deno_wrapper}}
-        # EJS is bundled by yt-dlp[default]; GitHub fallback is allowed if the
-        # local package is absent, without requiring npm or a separate service.
-        safari_options["remote_components"] = ["ejs:github"]
-        if has_cookies:
-            safari_options["cookiefile"] = str(cookie_path)
-        profiles.append(("web_safari_deno_lowmem", safari_options))
-        print("🧠 YouTube JS challenge solver: Deno enabled for one profile only; V8 heap capped at 64 MB.")
-    else:
-        print("⚠️ Deno runtime नहीं मिला; JavaScript challenge solving उपलब्ध नहीं होगा।")
 
-    # Lightweight fallback profiles do not launch a JS child process.
-    for profile_name in ("web_safari", "web_embedded", "tv", "default"):
-        options = dict(base_options)
-        if profile_name != "default":
-            options["extractor_args"] = {
-                "youtube": {"player_client": [profile_name]}
-            }
-        if has_cookies and profile_name in ("web_safari", "default"):
-            options["cookiefile"] = str(cookie_path)
-        options["js_runtimes"] = {}
-        profiles.append((profile_name + "_nojs", options))
+    # Recommended mweb client with on-demand BgUtil GVS PO-token generation.
+    if BGUTIL_SETUP_OK and DENO_EXECUTABLE:
+        mweb_options = dict(base_options)
+        mweb_options["js_runtimes"] = {"deno": {"path": DENO_EXECUTABLE}}
+        mweb_options["extractor_args"] = {
+            "youtube": {"player_client": ["mweb"]},
+            "youtubepot-bgutilscript": {"server_home": [str(BGUTIL_SERVER_DIR)]},
+        }
+        if has_cookies:
+            mweb_options["cookiefile"] = str(cookie_path)
+        profiles.append(("mweb_bgutil_pot", mweb_options))
+    else:
+        print("⚠️ BgUtil unavailable; mweb PO-token profile skip किया गया।")
+
+    # TV client is a lightweight no-PO-token fallback.
+    tv_options = dict(base_options)
+    tv_options["extractor_args"] = {"youtube": {"player_client": ["tv"]}}
+    profiles.append(("tv", tv_options))
+
+    # Safari HLS can expose streams when the regular web client is SABR-only.
+    safari_options = dict(base_options)
+    safari_options["extractor_args"] = {"youtube": {"player_client": ["web_safari"]}}
+    if has_cookies:
+        safari_options["cookiefile"] = str(cookie_path)
+    profiles.append(("web_safari", safari_options))
+
+    # Embedded client can work for videos that permit embedding; cookies are
+    # passed when available, but this profile is not guaranteed for all videos.
+    embedded_options = dict(base_options)
+    embedded_options["extractor_args"] = {"youtube": {"player_client": ["web_embedded"]}}
+    if has_cookies:
+        embedded_options["cookiefile"] = str(cookie_path)
+    profiles.append(("web_embedded", embedded_options))
+
+    # Android does not support account-cookie authentication in yt-dlp.
+    android_options = dict(base_options)
+    android_options["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+    profiles.append(("android", android_options))
+
+    # Last attempt: yt-dlp's own current client selection with the cookie file.
+    default_options = dict(base_options)
+    if has_cookies:
+        default_options["cookiefile"] = str(cookie_path)
+    profiles.append(("default", default_options))
 
     info = None
     profile_errors = []
     for profile_name, profile_options in profiles:
-        print(f"🔄 yt-dlp profile शुरू: {profile_name}")
         try:
             with yt_dlp.YoutubeDL(profile_options) as ydl:
                 candidate = ydl.extract_info(video_url, download=False)
@@ -438,13 +585,15 @@ def _resolve_with_ytdlp(video_url):
             profile_errors.append(f"{profile_name}: no video formats returned")
             print(f"⚠️ yt-dlp profile failed: {profile_name} (no formats)")
         except Exception as error:
-            detail = " ".join(str(error).split())[:180]
+            # Exception text is useful for distinguishing LOGIN_REQUIRED,
+            # PO-token and no-format failures. Never print cookie values.
+            detail = str(error).replace("\n", " ")[:180]
             profile_errors.append(f"{profile_name}: {type(error).__name__}: {detail}")
             print(f"⚠️ yt-dlp profile failed: {profile_name}: {type(error).__name__}: {detail}")
 
     if info is None:
         raise RuntimeError(
-            "YouTube extraction असफल: " + " | ".join(profile_errors)
+            "सभी YouTube client profiles असफल: " + " | ".join(profile_errors)
         )
 
     formats = info.get("formats") or []
@@ -1015,7 +1164,8 @@ async def main():
 
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
 
-    print("🪶 LOW-RAM MODE: Piped first, yt-dlp fallback; Deno/Node JS runtime disabled.")
+    print("🪶 LOW-RAM MODE: Piped first; yt-dlp fallback with on-demand BgUtil PO token.")
+    await asyncio.to_thread(ensure_bgutil_provider)
     await asyncio.to_thread(diagnose_youtube_cookies)
 
     bot = Client(
@@ -1088,7 +1238,7 @@ async def main():
         print("✅ Music Buttons Registered")
         print("🎵 Pandey Music Bot Online!")
         print("🌐 YouTube Search Enabled!")
-        print("🧠 Piped resolver + yt-dlp fallback enabled; Deno/Node child process disabled.")
+        print("🧠 Piped + yt-dlp resolver enabled; BgUtil PO-token script: " + ("ON-DEMAND" if BGUTIL_SETUP_OK else "UNAVAILABLE"))
         print("🎛 Inline Music Controls Enabled!")
         print("⚙️ HIGH Audio Quality / Low Worker Mode Enabled!")
         print("👤 Clickable Requester Profile Tag Enabled!")
