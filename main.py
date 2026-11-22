@@ -324,24 +324,58 @@ def diagnose_youtube_cookies():
         print("ℹ️ File structure पढ़ने योग्य है; network/IP block की वजह से acceptance जाँची नहीं जा सकी।")
 
 
-def _resolve_with_ytdlp(video_url):
-    """Try current yt-dlp YouTube clients without spawning a JS runtime.
+def _low_memory_deno_path():
+    """Create a tiny Deno launcher that caps V8 heap for this 294 MB host.
 
-    This host has a 294 MB memory ceiling, so Deno/Node remain disabled.
-    Client availability changes on YouTube; each profile is isolated so one
-    blocked client cannot prevent the remaining profiles from being tried.
+    yt-dlp's Python API accepts a runtime path but not runtime CLI arguments.
+    The wrapper inserts the V8 limit as a separate argument (not one combined
+    flag string), avoiding the malformed-flag error seen in earlier logs.
+    """
+    candidates = [
+        Path(__file__).resolve().parent / ".deno-runtime" / "deno",
+        Path.home() / ".deno" / "bin" / "deno",
+    ]
+    found = next((item for item in candidates if item.is_file()), None)
+    if found is None:
+        located = shutil.which("deno")
+        found = Path(located) if located else None
+    if found is None:
+        return None
+
+    wrapper = Path(__file__).resolve().parent / ".deno-lowmem-wrapper"
+    try:
+        # The V8 flag is a single argument to Deno; never combine multiple
+        # V8 flags with spaces. 64 MB is deliberately conservative.
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f"exec {str(found)!r} --v8-flags=--max-old-space-size=64 \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
+        return str(wrapper)
+    except OSError as error:
+        print(f"⚠️ Low-RAM Deno wrapper नहीं बन पाया: {type(error).__name__}")
+        return str(found)
+
+
+def _resolve_with_ytdlp(video_url):
+    """Resolve YouTube audio with one JS-enabled Safari attempt, then fallbacks.
+
+    YouTube currently needs EJS JavaScript challenge solving for some clients.
+    Only the web_safari/HLS attempt gets a memory-capped Deno runtime; this
+    avoids launching Deno for every client profile on the 294 MB container.
     """
     try:
         import yt_dlp
     except ImportError as error:
         raise RuntimeError(
-            "yt-dlp installed नहीं है। requirements.txt में yt-dlp जोड़ें।"
+            "yt-dlp installed नहीं है। requirements.txt में yt-dlp[default] जोड़ें।"
         ) from error
 
     cookie_path = _youtube_cookie_path()
     has_cookies = cookie_path.is_file() and cookie_path.stat().st_size > 0
     if has_cookies:
-        print("🍪 YouTube cookies enabled only for clients that support account cookies.")
+        print("🍪 YouTube cookies enabled for supported yt-dlp profiles.")
     else:
         print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
@@ -352,9 +386,7 @@ def _resolve_with_ytdlp(video_url):
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
-        # Deno/Node can push this 294 MB container into OOM.
-        "js_runtimes": {},
-        "socket_timeout": 7,
+        "socket_timeout": 8,
         "retries": 1,
         "extractor_retries": 1,
         "fragment_retries": 1,
@@ -363,41 +395,34 @@ def _resolve_with_ytdlp(video_url):
     }
 
     profiles = []
-
-    # These clients do not use the user's account cookies. Trying them first
-    # avoids accidentally triggering TV-client DRM behavior with logged-in cookies.
-    for profile_name in ("tv", "tv_downgraded", "tv_samsung", "tv_simply"):
-        options = dict(base_options)
-        options["extractor_args"] = {
-            "youtube": {"player_client": [profile_name]}
+    deno_wrapper = _low_memory_deno_path()
+    if deno_wrapper:
+        safari_options = dict(base_options)
+        safari_options["extractor_args"] = {
+            "youtube": {"player_client": ["web_safari"]}
         }
-        profiles.append((profile_name, options))
-
-    # Safari can return HLS formats; recent YouTube changes may restrict them
-    # to trusted/logged-in sessions, so pass cookies only to supported clients.
-    for profile_name in ("web_safari", "web_embedded", "web_music", "web"):
-        options = dict(base_options)
-        options["extractor_args"] = {
-            "youtube": {"player_client": [profile_name]}
-        }
+        safari_options["js_runtimes"] = {"deno": {"path": deno_wrapper}}
+        # EJS is bundled by yt-dlp[default]; GitHub fallback is allowed if the
+        # local package is absent, without requiring npm or a separate service.
+        safari_options["remote_components"] = ["ejs:github"]
         if has_cookies:
-            options["cookiefile"] = str(cookie_path)
-        profiles.append((profile_name, options))
+            safari_options["cookiefile"] = str(cookie_path)
+        profiles.append(("web_safari_deno_lowmem", safari_options))
+        print("🧠 YouTube JS challenge solver: Deno enabled for one profile only; V8 heap capped at 64 MB.")
+    else:
+        print("⚠️ Deno runtime नहीं मिला; JavaScript challenge solving उपलब्ध नहीं होगा।")
 
-    # Mobile clients do not accept account cookies. They are best-effort only:
-    # current YouTube deployments may require per-video PO tokens for them.
-    for profile_name in ("android_vr", "ios", "mweb", "android"):
+    # Lightweight fallback profiles do not launch a JS child process.
+    for profile_name in ("web_safari", "web_embedded", "tv", "default"):
         options = dict(base_options)
-        options["extractor_args"] = {
-            "youtube": {"player_client": [profile_name]}
-        }
-        profiles.append((profile_name, options))
-
-    # Keep yt-dlp's own client selection as the final compatibility attempt.
-    default_options = dict(base_options)
-    if has_cookies:
-        default_options["cookiefile"] = str(cookie_path)
-    profiles.append(("default", default_options))
+        if profile_name != "default":
+            options["extractor_args"] = {
+                "youtube": {"player_client": [profile_name]}
+            }
+        if has_cookies and profile_name in ("web_safari", "default"):
+            options["cookiefile"] = str(cookie_path)
+        options["js_runtimes"] = {}
+        profiles.append((profile_name + "_nojs", options))
 
     info = None
     profile_errors = []
@@ -413,14 +438,13 @@ def _resolve_with_ytdlp(video_url):
             profile_errors.append(f"{profile_name}: no video formats returned")
             print(f"⚠️ yt-dlp profile failed: {profile_name} (no formats)")
         except Exception as error:
-            # Keep diagnostics useful without exposing cookie contents.
-            detail = " ".join(str(error).split())[:160]
+            detail = " ".join(str(error).split())[:180]
             profile_errors.append(f"{profile_name}: {type(error).__name__}: {detail}")
             print(f"⚠️ yt-dlp profile failed: {profile_name}: {type(error).__name__}: {detail}")
 
     if info is None:
         raise RuntimeError(
-            "सभी YouTube client profiles असफल: " + " | ".join(profile_errors)
+            "YouTube extraction असफल: " + " | ".join(profile_errors)
         )
 
     formats = info.get("formats") or []
