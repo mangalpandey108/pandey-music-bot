@@ -286,8 +286,30 @@ def _resolve_with_ytdlp(video_url):
     else:
         print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+    # Some YouTube videos expose no format matching the strict audio-only
+    # selector. Try audio-only first, then fall back to the best available
+    # muxed format (FFmpeg/PyTgCalls will read its audio stream).
+    info = None
+    format_errors = []
+    for format_selector in ("bestaudio/best", "best"):
+        attempt_options = dict(options)
+        attempt_options["format"] = format_selector
+        try:
+            with yt_dlp.YoutubeDL(attempt_options) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            if isinstance(info, dict) and (info.get("url") or info.get("formats")):
+                if format_selector == "best":
+                    print("ℹ️ Audio-only format unavailable; using best available stream.")
+                break
+            info = None
+        except Exception as error:
+            format_errors.append(f"{format_selector}: {type(error).__name__}")
+            info = None
+
+    if info is None:
+        raise RuntimeError(
+            "yt-dlp कोई playable format नहीं निकाल पाया (" + "; ".join(format_errors) + ")"
+        )
 
     if not isinstance(info, dict):
         raise RuntimeError("yt-dlp से video जानकारी नहीं मिली।")
