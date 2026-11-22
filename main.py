@@ -244,6 +244,86 @@ def _resolve_with_piped(video_id):
 
     return None, errors
 
+def _youtube_cookie_path():
+    """Return configured cookie path without exposing cookie contents."""
+    cookie_env = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
+    if cookie_env:
+        path = Path(cookie_env).expanduser()
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        return path
+    return Path(__file__).resolve().parent / "cookies.txt"
+
+
+def diagnose_youtube_cookies():
+    """Check Netscape cookie-file structure and whether YouTube sees a login.
+
+    This never prints cookie values. A definitive VALID result requires the
+    YouTube homepage to report LOGGED_IN=true; a blocked/changed response is
+    reported as inconclusive rather than incorrectly calling cookies invalid.
+    """
+    import http.cookiejar
+    import re
+
+    path = _youtube_cookie_path()
+    print("🔎 YouTube cookies diagnostic शुरू...")
+    if not path.is_file():
+        print(f"❌ COOKIE FILE MISSING: {path.name} नहीं मिली।")
+        return
+    if path.stat().st_size == 0:
+        print("❌ COOKIE FILE EMPTY: cookies.txt खाली है।")
+        return
+
+    jar = http.cookiejar.MozillaCookieJar(str(path))
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception as error:
+        print(f"❌ COOKIE FILE INVALID: Netscape format पढ़ नहीं पाया ({type(error).__name__})।")
+        print("ℹ️ Browser से cookies को Netscape HTTP Cookie File format में दोबारा export करें।")
+        return
+
+    youtube_cookies = [c for c in jar if "youtube.com" in (c.domain or "").lower()
+                       or "google.com" in (c.domain or "").lower()]
+    auth_names = {"SID", "HSID", "SSID", "APISID", "SAPISID", "LOGIN_INFO",
+                  "__Secure-1PSID", "__Secure-3PSID", "__Secure-1PAPISID",
+                  "__Secure-3PAPISID"}
+    auth_cookies = [c for c in youtube_cookies if c.name in auth_names]
+    now = time.time()
+    live_auth = [c for c in auth_cookies if not c.is_expired(now)]
+    print(f"📄 COOKIE FILE READABLE: {len(youtube_cookies)} YouTube/Google cookies मिले; values छिपाई गई हैं।")
+    print(f"🔐 AUTH COOKIE CHECK: {len(auth_cookies)} पहचान वाले auth cookies, {len(live_auth)} unexpired।")
+
+    if not youtube_cookies:
+        print("❌ COOKIE CONTENT INVALID/WRONG: YouTube/Google domain cookies नहीं मिले।")
+        return
+    if not live_auth:
+        print("⚠️ AUTH COOKIES MISSING/EXPIRED: login cookies नहीं मिले या expire हो चुके हैं।")
+        print("ℹ️ YouTube से logged-in browser session की नई Netscape cookies export करें।")
+        return
+
+    try:
+        session = requests.Session()
+        session.cookies.update(jar)
+        response = session.get(
+            "https://www.youtube.com/", timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"},
+            allow_redirects=True,
+        )
+        if response.status_code == 200:
+            match = re.search(r'"LOGGED_IN"\s*:\s*(true|false)', response.text, re.I)
+            if match and match.group(1).lower() == "true":
+                print("✅ COOKIES VALID: YouTube ne cookies accept ki aur logged-in session confirm hua.")
+                return
+            if match and match.group(1).lower() == "false":
+                print("❌ COOKIES NOT AUTHENTICATED: YouTube ne request ko logged-out dikhaya; cookies expired/invalid ho sakti hain.")
+                return
+        print(f"⚠️ COOKIE STATUS INCONCLUSIVE: YouTube HTTP {response.status_code}; response में login status confirm नहीं हुआ।")
+        print("ℹ️ Cookies file पढ़ने योग्य है, लेकिन YouTube/IP restriction के कारण server-side validity confirm नहीं हुई।")
+    except Exception as error:
+        print(f"⚠️ COOKIE STATUS INCONCLUSIVE: YouTube validation request failed ({type(error).__name__})।")
+        print("ℹ️ File structure पढ़ने योग्य है; network/IP block की वजह से acceptance जाँची नहीं जा सकी।")
+
+
 def _resolve_with_ytdlp(video_url):
     try:
         import yt_dlp
@@ -255,13 +335,7 @@ def _resolve_with_ytdlp(video_url):
     # Use the server's existing cookies.txt when available. This helps with
     # YouTube's "Sign in to confirm you're not a bot" gate. Never print cookie
     # contents or copy them into logs.
-    cookie_env = os.getenv("YOUTUBE_COOKIE_FILE", "").strip()
-    if cookie_env:
-        cookie_path = Path(cookie_env).expanduser()
-        if not cookie_path.is_absolute():
-            cookie_path = Path(__file__).resolve().parent / cookie_path
-    else:
-        cookie_path = Path(__file__).resolve().parent / "cookies.txt"
+    cookie_path = _youtube_cookie_path()
 
     options = {
         "format": "bestaudio/best",
@@ -897,6 +971,7 @@ async def main():
     print("🤖 Pandey Music Bot शुरू हो रहा है...")
 
     print("🪶 LOW-RAM MODE: Piped first, yt-dlp fallback; Deno/Node JS runtime disabled.")
+    await asyncio.to_thread(diagnose_youtube_cookies)
 
     bot = Client(
         "PandeyMusicBot",
