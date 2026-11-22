@@ -286,25 +286,37 @@ def _resolve_with_ytdlp(video_url):
     else:
         print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
-    # Some YouTube videos expose no format matching the strict audio-only
-    # selector. Try audio-only first, then fall back to the best available
-    # muxed format (FFmpeg/PyTgCalls will read its audio stream).
+    # Datacenter IPs often receive SABR-only/empty formats from YouTube's
+    # default web clients. Try the Android client first (no account cookies),
+    # then retry the default client with cookies. No external JS runtime is
+    # spawned, keeping the 294 MB host safer.
     info = None
     format_errors = []
-    for format_selector in ("bestaudio/best", "best"):
-        attempt_options = dict(options)
-        attempt_options["format"] = format_selector
-        try:
-            with yt_dlp.YoutubeDL(attempt_options) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-            if isinstance(info, dict) and (info.get("url") or info.get("formats")):
-                if format_selector == "best":
-                    print("ℹ️ Audio-only format unavailable; using best available stream.")
-                break
-            info = None
-        except Exception as error:
-            format_errors.append(f"{format_selector}: {type(error).__name__}")
-            info = None
+    profiles = []
+    android_options = dict(options)
+    android_options.pop("cookiefile", None)
+    android_options["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+    profiles.append(("android", android_options))
+    profiles.append(("default", dict(options)))
+
+    for profile_name, profile_options in profiles:
+        for format_selector in ("bestaudio/best", "best"):
+            attempt_options = dict(profile_options)
+            attempt_options["format"] = format_selector
+            try:
+                with yt_dlp.YoutubeDL(attempt_options) as ydl:
+                    info = ydl.extract_info(video_url, download=False)
+                if isinstance(info, dict) and (info.get("url") or info.get("formats")):
+                    print(f"✅ yt-dlp profile successful: {profile_name}")
+                    if format_selector == "best":
+                        print("ℹ️ Audio-only format unavailable; using best available stream.")
+                    break
+                info = None
+            except Exception as error:
+                format_errors.append(f"{profile_name}/{format_selector}: {type(error).__name__}")
+                info = None
+        if info is not None:
+            break
 
     if info is None:
         raise RuntimeError(
@@ -335,7 +347,7 @@ def _resolve_with_ytdlp(video_url):
             ),
             reverse=True,
         )
-        print("✅ Audio URL मिला: yt-dlp fallback (JavaScript runtime disabled)")
+        print("✅ Audio URL मिला: yt-dlp fallback (Android/default client; JS runtime disabled)")
         return audio_formats[0]["url"]
 
     # Some extractors return a single selected format at the top level.
