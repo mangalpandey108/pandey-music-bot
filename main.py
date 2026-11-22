@@ -325,6 +325,12 @@ def diagnose_youtube_cookies():
 
 
 def _resolve_with_ytdlp(video_url):
+    """Try YouTube clients that may expose formats without a JS runtime.
+
+    The host has a tight memory limit, so Deno/Node stay disabled.  The TV
+    client and Safari HLS client are tried before cookie-authenticated web
+    clients; Android is retained only as a no-cookie fallback.
+    """
     try:
         import yt_dlp
     except ImportError as error:
@@ -332,20 +338,21 @@ def _resolve_with_ytdlp(video_url):
             "yt-dlp installed नहीं है। requirements.txt में yt-dlp जोड़ें।"
         ) from error
 
-    # Use the server's existing cookies.txt when available. This helps with
-    # YouTube's "Sign in to confirm you're not a bot" gate. Never print cookie
-    # contents or copy them into logs.
     cookie_path = _youtube_cookie_path()
+    has_cookies = cookie_path.is_file() and cookie_path.stat().st_size > 0
+    if has_cookies:
+        print("🍪 YouTube cookies enabled for supported yt-dlp profiles.")
+    else:
+        print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
-    options = {
+    base_options = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
-        # Keep Deno/Node disabled to protect the small memory limit.
-        # Cookies are passed to yt-dlp when a local cookie file exists.
+        # Keep JS challenge runtimes disabled for the 294 MB container.
         "js_runtimes": {},
         "socket_timeout": 8,
         "retries": 1,
@@ -354,53 +361,64 @@ def _resolve_with_ytdlp(video_url):
         "concurrent_fragment_downloads": 1,
         "overwrites": False,
     }
-    if cookie_path.is_file() and cookie_path.stat().st_size > 0:
-        options["cookiefile"] = str(cookie_path)
-        print("🍪 YouTube cookies enabled for yt-dlp fallback.")
-    else:
-        print("⚠️ cookies.txt नहीं मिली; yt-dlp बिना cookies कोशिश करेगा।")
 
-    # Datacenter IPs often receive SABR-only/empty formats from YouTube's
-    # default web clients. Try the Android client first (no account cookies),
-    # then retry the default client with cookies. No external JS runtime is
-    # spawned, keeping the 294 MB host safer.
-    info = None
-    format_errors = []
     profiles = []
-    android_options = dict(options)
-    android_options.pop("cookiefile", None)
+
+    # TV client does not require a PO token for its formats in current yt-dlp.
+    tv_options = dict(base_options)
+    tv_options["extractor_args"] = {"youtube": {"player_client": ["tv"]}}
+    profiles.append(("tv", tv_options))
+
+    # Safari HLS can expose streams when the regular web client is SABR-only.
+    safari_options = dict(base_options)
+    safari_options["extractor_args"] = {"youtube": {"player_client": ["web_safari"]}}
+    if has_cookies:
+        safari_options["cookiefile"] = str(cookie_path)
+    profiles.append(("web_safari", safari_options))
+
+    # Embedded client can work for videos that permit embedding; cookies are
+    # passed when available, but this profile is not guaranteed for all videos.
+    embedded_options = dict(base_options)
+    embedded_options["extractor_args"] = {"youtube": {"player_client": ["web_embedded"]}}
+    if has_cookies:
+        embedded_options["cookiefile"] = str(cookie_path)
+    profiles.append(("web_embedded", embedded_options))
+
+    # Android does not support account-cookie authentication in yt-dlp.
+    android_options = dict(base_options)
     android_options["extractor_args"] = {"youtube": {"player_client": ["android"]}}
     profiles.append(("android", android_options))
-    profiles.append(("default", dict(options)))
 
+    # Last attempt: yt-dlp's own current client selection with the cookie file.
+    default_options = dict(base_options)
+    if has_cookies:
+        default_options["cookiefile"] = str(cookie_path)
+    profiles.append(("default", default_options))
+
+    info = None
+    profile_errors = []
     for profile_name, profile_options in profiles:
-        for format_selector in ("bestaudio/best", "best"):
-            attempt_options = dict(profile_options)
-            attempt_options["format"] = format_selector
-            try:
-                with yt_dlp.YoutubeDL(attempt_options) as ydl:
-                    info = ydl.extract_info(video_url, download=False)
-                if isinstance(info, dict) and (info.get("url") or info.get("formats")):
-                    print(f"✅ yt-dlp profile successful: {profile_name}")
-                    if format_selector == "best":
-                        print("ℹ️ Audio-only format unavailable; using best available stream.")
-                    break
-                info = None
-            except Exception as error:
-                format_errors.append(f"{profile_name}/{format_selector}: {type(error).__name__}")
-                info = None
-        if info is not None:
-            break
+        try:
+            with yt_dlp.YoutubeDL(profile_options) as ydl:
+                candidate = ydl.extract_info(video_url, download=False)
+            if isinstance(candidate, dict) and (candidate.get("url") or candidate.get("formats")):
+                info = candidate
+                print(f"✅ yt-dlp profile successful: {profile_name}")
+                break
+            profile_errors.append(f"{profile_name}: no video formats returned")
+            print(f"⚠️ yt-dlp profile failed: {profile_name} (no formats)")
+        except Exception as error:
+            # Exception text is useful for distinguishing LOGIN_REQUIRED,
+            # PO-token and no-format failures. Never print cookie values.
+            detail = str(error).replace("\n", " ")[:180]
+            profile_errors.append(f"{profile_name}: {type(error).__name__}: {detail}")
+            print(f"⚠️ yt-dlp profile failed: {profile_name}: {type(error).__name__}: {detail}")
 
     if info is None:
         raise RuntimeError(
-            "yt-dlp कोई playable format नहीं निकाल पाया (" + "; ".join(format_errors) + ")"
+            "सभी YouTube client profiles असफल: " + " | ".join(profile_errors)
         )
 
-    if not isinstance(info, dict):
-        raise RuntimeError("yt-dlp से video जानकारी नहीं मिली।")
-
-    # Prefer audio-only formats, with the highest available audio bitrate.
     formats = info.get("formats") or []
     audio_formats = []
     for item in formats:
@@ -421,16 +439,15 @@ def _resolve_with_ytdlp(video_url):
             ),
             reverse=True,
         )
-        print("✅ Audio URL मिला: yt-dlp fallback (Android/default client; JS runtime disabled)")
+        print("✅ Audio URL मिला: yt-dlp client fallback")
         return audio_formats[0]["url"]
 
-    # Some extractors return a single selected format at the top level.
     direct_url = info.get("url")
     if direct_url and info.get("acodec") not in (None, "none"):
         print("✅ Audio URL मिला: yt-dlp selected format")
         return direct_url
 
-    raise RuntimeError("yt-dlp को playable audio-only format नहीं मिला।")
+    raise RuntimeError("yt-dlp response में playable audio-only format नहीं मिला।")
 
 def extract_audio_url(video_url):
     video_id = _youtube_video_id(video_url)
