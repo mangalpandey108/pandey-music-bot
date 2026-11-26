@@ -40,6 +40,9 @@ API_ID = int(API_ID_TEXT)
 BOT_TITLE = "🎵 PANDEY MUSIC BOT"
 POWERED_BY = "👑 POWERED BY @The_PANDEY_G"
 
+RESTART_DELAY = 10
+MAX_RESTART_DELAY = 60
+
 
 # ==================================================
 # GLOBALS
@@ -141,7 +144,7 @@ def music_keyboard(chat_id):
 
 
 # ==================================================
-# AUTO DELETE
+# INSTANT AUTO DELETE
 # ==================================================
 
 async def safe_delete(message):
@@ -156,11 +159,17 @@ async def safe_delete(message):
 def auto_delete_command(func):
     @wraps(func)
     async def wrapper(client, message, *args, **kwargs):
-        try:
-            return await func(client, message, *args, **kwargs)
 
-        finally:
-            await safe_delete(message)
+        # Command आते ही सबसे पहले Delete
+        await safe_delete(message)
+
+        # Delete के बाद Command Processing
+        return await func(
+            client,
+            message,
+            *args,
+            **kwargs
+        )
 
     return wrapper
 
@@ -385,7 +394,8 @@ async def play_next(chat_id):
             await bot.send_message(
                 chat_id,
                 bot_header()
-                + "❌ गाना नहीं चल पाया। Console Error जाँचें।"
+                + "❌ गाना नहीं चल पाया। "
+                + "YouTube या Audio Stream में समस्या हो सकती है।"
             )
 
         except Exception:
@@ -521,7 +531,8 @@ async def play_command(client, message):
 
         else:
             await status.edit_text(
-                bot_header() + "❌ गाना शुरू नहीं हो पाया।"
+                bot_header()
+                + "❌ गाना शुरू नहीं हो पाया।"
             )
 
     except Exception as error:
@@ -916,11 +927,17 @@ async def main():
             )
         )
 
-        print("✅ Auto Delete Enabled")
+        print("✅ Instant Auto Delete Enabled")
+        print("✅ Auto Recovery Enabled")
         print("✅ Music Buttons Registered")
         print("🎵 PANDEY MUSIC BOT ONLINE!")
         print("👑 POWERED BY @The_PANDEY_G")
         print("🌐 Multi-Group Queue Enabled!")
+
+        # Restart के बाद बची हुई Queue को फिर शुरू करने की कोशिश
+        for chat_id in list(queues.keys()):
+            if queues[chat_id]:
+                asyncio.create_task(play_next(chat_id))
 
         await asyncio.Event().wait()
 
@@ -931,6 +948,23 @@ async def main():
 
     finally:
         print("🛑 Bot बंद हो रहा है...")
+
+        # Restart के समय current song को Queue में वापस रखें
+        for chat_id, song in list(current_songs.items()):
+            if song:
+                queues[chat_id].appendleft(song)
+
+        current_songs.clear()
+        playback_starting.clear()
+        skip_in_progress.clear()
+        stop_in_progress.clear()
+
+        try:
+            if calls:
+                await calls.stop()
+
+        except Exception:
+            traceback.print_exc()
 
         try:
             if user and user.is_connected:
@@ -946,8 +980,51 @@ async def main():
         except Exception:
             traceback.print_exc()
 
-        http.close()
+        bot = None
+        user = None
+        calls = None
 
+
+# ==================================================
+# AUTO RESTART SUPERVISOR
+# ==================================================
+
+async def run_forever():
+    restart_delay = RESTART_DELAY
+
+    while True:
+        try:
+            await main()
+
+            print("⚠️ Bot unexpectedly stopped.")
+
+        except Exception as error:
+            print(
+                f"❌ BOT CRASH: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            traceback.print_exc()
+
+        print(
+            f"🔄 Bot {restart_delay} सेकंड बाद Restart होगा..."
+        )
+
+        await asyncio.sleep(restart_delay)
+
+        restart_delay = min(
+            restart_delay * 2,
+            MAX_RESTART_DELAY
+        )
+
+
+# ==================================================
+# RUN
+# ==================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(run_forever())
+
+    except KeyboardInterrupt:
+        print("🛑 Bot manually बंद किया गया।")
