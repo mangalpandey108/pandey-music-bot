@@ -953,11 +953,18 @@ async def restart_command(client, message):
         )
         return
 
+    # API key की मौजूदगी जाँचें; secret कभी log न करें
     if not SILLYDEV_API_KEY:
+        print("❌ SillyDev API key loaded: False")
+
         await message.reply_text(
-            "❌ SILLYDEV_API_KEY .env में नहीं मिली।"
+            "❌ SILLYDEV_API_KEY .env में नहीं मिली। "
+            "जाँचें कि .env, main.py वाले folder में है।"
         )
         return
+
+    print("🔑 SillyDev API key loaded: True")
+    print(f"🖥️ SillyDev server ID configured: {bool(SILLYDEV_SERVER_ID)}")
 
     await message.reply_text(
         "🔄 SillyDev server restart request भेज रहा हूँ..."
@@ -978,23 +985,58 @@ async def restart_command(client, message):
     try:
         response = await asyncio.to_thread(request_restart)
 
+        # Restart endpoint सफल होने पर 204 लौटाता है
         if response.status_code == 204:
             print("✅ SillyDev restart request accepted.")
+
+            await telegram_send(
+                message.chat.id,
+                "✅ SillyDev ने restart request स्वीकार कर ली।"
+            )
             return
+
+        # Response body में API key कभी print न करें
+        response_text = (response.text or "")[:500]
 
         print(
             f"❌ SillyDev API response: "
-            f"{response.status_code} | {response.text[:500]}"
+            f"{response.status_code} | {response_text}"
         )
+
+        if response.status_code == 401:
+            user_message = (
+                "❌ SillyDev ने API key स्वीकार नहीं की (401). "
+                "Secret key सही, पूरी और active है या नहीं जाँचें।"
+            )
+
+        elif response.status_code == 403:
+            user_message = (
+                "❌ API key के पास restart permission नहीं है (403). "
+                "Key में सही server और restart permission जाँचें।"
+            )
+
+        elif response.status_code == 404:
+            user_message = (
+                "❌ Server नहीं मिला या इस key को उस server का access नहीं है (404). "
+                "Server ID और key का server access जाँचें।"
+            )
+
+        else:
+            user_message = (
+                f"❌ SillyDev restart request असफल रही "
+                f"({response.status_code}). Server logs जाँचें।"
+            )
 
         await telegram_send(
             message.chat.id,
-            "❌ SillyDev ने restart request स्वीकार नहीं की। "
-            "API key, permission और server ID जाँचें।"
+            user_message
         )
 
     except requests.RequestException as error:
-        print(f"❌ SillyDev restart API error: {error}")
+        print(
+            f"❌ SillyDev restart API connection error: "
+            f"{type(error).__name__}: {error}"
+        )
 
         try:
             await telegram_send(
