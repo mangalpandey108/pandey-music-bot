@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import traceback
@@ -33,6 +32,13 @@ API_ID_TEXT = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+
+# SillyDev API
+SILLYDEV_API_KEY = os.getenv("SILLYDEV_API_KEY", "").strip()
+OWNER_ID_TEXT = os.getenv("OWNER_ID", "").strip()
+
+SILLYDEV_SERVER_ID = "92eaec77"
+SILLYDEV_API_URL = "https://sillydev.co.uk/panel/api/client"
 
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
     raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
@@ -619,7 +625,8 @@ async def start_command(client, message):
         + "/skip\n"
         + "/stop\n"
         + "/end\n"
-        + "/queue",
+        + "/queue\n"
+        + "/restart",
         disable_web_page_preview=True
     )
 
@@ -930,6 +937,75 @@ async def queue_command(client, message):
 
 
 # ==================================================
+# HOST RESTART
+# ==================================================
+
+@auto_delete_command
+async def restart_command(client, message):
+    # केवल configured owner को अनुमति
+    if (
+        not message.from_user
+        or not OWNER_ID_TEXT.isdigit()
+        or str(message.from_user.id) != OWNER_ID_TEXT
+    ):
+        await message.reply_text(
+            "⛔ यह command सिर्फ bot owner चला सकता है।"
+        )
+        return
+
+    if not SILLYDEV_API_KEY:
+        await message.reply_text(
+            "❌ SILLYDEV_API_KEY .env में नहीं मिली।"
+        )
+        return
+
+    await message.reply_text(
+        "🔄 SillyDev server restart request भेज रहा हूँ..."
+    )
+
+    def request_restart():
+        return requests.post(
+            f"{SILLYDEV_API_URL}/servers/{SILLYDEV_SERVER_ID}/power",
+            headers={
+                "Authorization": f"Bearer {SILLYDEV_API_KEY}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={"signal": "restart"},
+            timeout=15,
+        )
+
+    try:
+        response = await asyncio.to_thread(request_restart)
+
+        if response.status_code == 204:
+            print("✅ SillyDev restart request accepted.")
+            return
+
+        print(
+            f"❌ SillyDev API response: "
+            f"{response.status_code} | {response.text[:500]}"
+        )
+
+        await telegram_send(
+            message.chat.id,
+            "❌ SillyDev ने restart request स्वीकार नहीं की। "
+            "API key, permission और server ID जाँचें।"
+        )
+
+    except requests.RequestException as error:
+        print(f"❌ SillyDev restart API error: {error}")
+
+        try:
+            await telegram_send(
+                message.chat.id,
+                "❌ SillyDev API से संपर्क नहीं हो पाया।"
+            )
+        except Exception:
+            pass
+
+
+# ==================================================
 # CALLBACK BUTTONS
 # ==================================================
 
@@ -1076,7 +1152,8 @@ async def main():
         ("skip", skip_command),
         ("stop", stop_command),
         ("end", end_command),
-        ("queue", queue_command)
+        ("queue", queue_command),
+        ("restart", restart_command)
     ]
 
     try:
