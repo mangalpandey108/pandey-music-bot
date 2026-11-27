@@ -5,6 +5,7 @@ import traceback
 import time
 import requests
 import yt_dlp
+import gc
 
 from pathlib import Path
 from collections import defaultdict, deque
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 
 from pytgcalls import PyTgCalls, filters as call_filters
 from pytgcalls.types import MediaStream, AudioQuality, StreamEnded
@@ -43,6 +45,12 @@ POWERED_BY = "👑 POWERED BY @The_PANDEY_G"
 RESTART_DELAY = 10
 MAX_RESTART_DELAY = 60
 
+# हर गाने के बाद Python garbage collection
+CLEANUP_AFTER_TRACK = True
+
+# Telegram FloodWait पर अधिकतम अतिरिक्त retry
+TELEGRAM_RETRIES = 3
+
 
 # ==================================================
 # GLOBALS
@@ -60,6 +68,82 @@ skip_in_progress = set()
 stop_in_progress = set()
 
 http = requests.Session()
+
+
+# ==================================================
+# MEMORY CLEANUP
+# ==================================================
+
+def memory_cleanup(chat_id=None, reason="cleanup"):
+    """
+    Python के unused objects हटाता है।
+    Active stream या दूसरे chats की Queue को नहीं छूता।
+    """
+
+    try:
+        if chat_id is not None:
+            if (
+                chat_id in queues
+                and not queues[chat_id]
+                and chat_id not in current_songs
+                and chat_id not in playback_starting
+            ):
+                queues.pop(chat_id, None)
+
+        collected = gc.collect()
+
+        print(
+            f"🧹 MEMORY CLEANUP | "
+            f"Reason: {reason} | "
+            f"Collected: {collected}"
+        )
+
+    except Exception as error:
+        print(f"⚠️ MEMORY CLEANUP ERROR: {error}")
+
+
+def cleanup_all():
+    """Shutdown के समय सभी अस्थायी Python objects साफ करना।"""
+
+    try:
+        gc.collect()
+        print("🧹 Final garbage collection completed")
+
+    except Exception:
+        traceback.print_exc()
+
+
+# ==================================================
+# TELEGRAM FLOODWAIT HELPER
+# ==================================================
+
+async def telegram_send(chat_id, text, **kwargs):
+    """
+    Telegram FloodWait आने पर निर्धारित समय तक इंतजार करके retry करता है।
+    """
+
+    for attempt in range(TELEGRAM_RETRIES + 1):
+        try:
+            return await bot.send_message(
+                chat_id,
+                text,
+                **kwargs
+            )
+
+        except FloodWait as error:
+            wait_time = int(error.value) + 1
+
+            print(
+                f"⏳ Telegram FloodWait: "
+                f"{wait_time}s | Chat: {chat_id}"
+            )
+
+            if attempt >= TELEGRAM_RETRIES:
+                raise
+
+            await asyncio.sleep(wait_time)
+
+    return None
 
 
 # ==================================================
@@ -144,13 +228,22 @@ def music_keyboard(chat_id):
 
 
 # ==================================================
-# INSTANT AUTO DELETE
+# SAFE TELEGRAM OPERATIONS
 # ==================================================
 
 async def safe_delete(message):
     try:
         await message.delete()
         print("🗑️ Command Message Deleted")
+
+    except FloodWait as error:
+        print(f"⏳ Delete FloodWait: {error.value}s")
+        await asyncio.sleep(int(error.value) + 1)
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
 
     except Exception as error:
         print(f"⚠️ Message Delete नहीं हुआ: {error}")
@@ -159,11 +252,8 @@ async def safe_delete(message):
 def auto_delete_command(func):
     @wraps(func)
     async def wrapper(client, message, *args, **kwargs):
-
-        # Command आते ही सबसे पहले Delete
         await safe_delete(message)
 
-        # Delete के बाद Command Processing
         return await func(
             client,
             message,
@@ -201,7 +291,7 @@ def now_playing_text(song):
 
 def queue_text(chat_id):
     current = current_songs.get(chat_id)
-    queue = queues[chat_id]
+    queue = queues.get(chat_id, deque())
 
     text = bot_header() + "📋 <b>MUSIC QUEUE</b>\n\n"
 
@@ -296,7 +386,13 @@ def search_youtube(query):
 # ==================================================
 
 def extract_audio_url(video_url):
+    """
+    yt-dlp का temporary object function समाप्त होने पर
+    अपने आप release हो जाता है।
+    """
+
     start = time.perf_counter()
+    audio_url = None
 
     options = {
         "format": "bestaudio[acodec!=none]/bestaudio/best",
@@ -304,33 +400,43 @@ def extract_audio_url(video_url):
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 10,
-        "retries": 1,
-        "extractor_retries": 1,
-        "fragment_retries": 1,
-        "cachedir": False
+        "socket_timeout": 15,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
+        "cachedir": False,
+        "nopart": True,
+        "overwrites": True
     }
 
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            video_url,
-            download=False
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                video_url,
+                download=False
+            )
+
+            if not info:
+                raise ValueError("Audio जानकारी नहीं मिली।")
+
+            audio_url = info.get("url")
+
+            if not audio_url:
+                raise ValueError("Direct Audio URL नहीं मिला।")
+
+            # Unneeded metadata reference हटाएँ
+            del info
+
+        print(
+            f"⚡ Extraction Time: "
+            f"{time.perf_counter() - start:.2f}s"
         )
 
-        if not info:
-            raise ValueError("Audio जानकारी नहीं मिली।")
+        return audio_url
 
-        audio_url = info.get("url")
-
-        if not audio_url:
-            raise ValueError("Direct Audio URL नहीं मिला।")
-
-    print(
-        f"⚡ Extraction Time: "
-        f"{time.perf_counter() - start:.2f}s"
-    )
-
-    return audio_url
+    finally:
+        # Function समाप्त होने पर local references release होंगे
+        gc.collect()
 
 
 # ==================================================
@@ -344,62 +450,106 @@ async def play_next(chat_id):
     playback_starting.add(chat_id)
 
     try:
-        if not queues[chat_id]:
-            current_songs.pop(chat_id, None)
-            return False
+        # एक गाना फेल होने पर Queue के अगले गाने की कोशिश
+        while queues.get(chat_id):
 
-        song = queues[chat_id].popleft()
+            song = queues[chat_id].popleft()
+            audio_url = None
+            media_stream = None
 
-        audio_url = await asyncio.to_thread(
-            extract_audio_url,
-            song["url"]
-        )
+            try:
+                print(
+                    f"🔎 Preparing: {song.get('title', 'Unknown')}"
+                )
 
-        await calls.play(
-            chat_id,
-            MediaStream(
-                audio_url,
-                AudioQuality.HIGH
-            )
-        )
+                audio_url = await asyncio.to_thread(
+                    extract_audio_url,
+                    song["url"]
+                )
 
-        current_songs[chat_id] = song
+                media_stream = MediaStream(
+                    audio_url,
+                    AudioQuality.HIGH
+                )
 
-        await bot.send_message(
-            chat_id,
-            now_playing_text(song),
-            reply_markup=music_keyboard(chat_id),
-            disable_web_page_preview=True
-        )
+                await calls.play(
+                    chat_id,
+                    media_stream
+                )
 
-        print(
-            f"🎵 Playing: {song['title']} | "
-            f"Requester: {song['requester']} | "
-            f"ID: {song.get('requester_id')}"
-        )
+                # Playback object को calls संभालता है।
+                # Bot में direct URL reference रखने की जरूरत नहीं।
+                del media_stream
+                media_stream = None
 
-        return True
+                del audio_url
+                audio_url = None
 
-    except Exception as error:
-        print(
-            f"❌ PLAY ERROR {chat_id}: "
-            f"{type(error).__name__}: {error}"
-        )
+                current_songs[chat_id] = song
 
-        traceback.print_exc()
+                try:
+                    await telegram_send(
+                        chat_id,
+                        now_playing_text(song),
+                        reply_markup=music_keyboard(chat_id),
+                        disable_web_page_preview=True
+                    )
+
+                except Exception as send_error:
+                    print(
+                        f"⚠️ Now Playing message failed: "
+                        f"{send_error}"
+                    )
+
+                print(
+                    f"🎵 Playing: {song['title']} | "
+                    f"Requester: {song['requester']} | "
+                    f"ID: {song.get('requester_id')}"
+                )
+
+                return True
+
+            except Exception as error:
+                print(
+                    f"❌ SONG PLAY ERROR {chat_id}: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+                traceback.print_exc()
+
+                # Failed song metadata release
+                song.clear()
+                del song
+
+                # Failed extraction के references हटाएँ
+                audio_url = None
+                media_stream = None
+
+                memory_cleanup(
+                    chat_id,
+                    reason="song_play_failed"
+                )
+
+                try:
+                    await telegram_send(
+                        chat_id,
+                        bot_header()
+                        + "❌ यह गाना नहीं चल पाया। "
+                        + "अगले गाने की कोशिश कर रहा हूँ।"
+                    )
+                except Exception as notify_error:
+                    print(
+                        f"⚠️ Error message failed: {notify_error}"
+                    )
+
+                continue
 
         current_songs.pop(chat_id, None)
 
-        try:
-            await bot.send_message(
-                chat_id,
-                bot_header()
-                + "❌ गाना नहीं चल पाया। "
-                + "YouTube या Audio Stream में समस्या हो सकती है।"
-            )
-
-        except Exception:
-            traceback.print_exc()
+        memory_cleanup(
+            chat_id,
+            reason="queue_finished"
+        )
 
         return False
 
@@ -416,21 +566,40 @@ async def stream_ended_handler(_, update: StreamEnded):
 
     print(f"🏁 STREAM ENDED: {chat_id}")
 
+    # Skip / Stop के दौरान आने वाले पुराने event को ignore करें
     if (
         chat_id in skip_in_progress
         or chat_id in stop_in_progress
     ):
         return
 
-    current_songs.pop(chat_id, None)
+    old_song = current_songs.pop(chat_id, None)
 
-    if queues[chat_id]:
+    if old_song:
+        old_song.clear()
+        del old_song
+
+    # पुराने track का cleanup
+    memory_cleanup(
+        chat_id,
+        reason="stream_ended"
+    )
+
+    if queues.get(chat_id):
         await play_next(chat_id)
 
     else:
-        await bot.send_message(
+        try:
+            await telegram_send(
+                chat_id,
+                bot_header() + "✅ Queue समाप्त हो गई।"
+            )
+        except Exception as error:
+            print(f"⚠️ Queue end message failed: {error}")
+
+        memory_cleanup(
             chat_id,
-            bot_header() + "✅ Queue समाप्त हो गई।"
+            reason="queue_empty"
         )
 
 
@@ -527,7 +696,10 @@ async def play_command(client, message):
         success = await play_next(chat_id)
 
         if success:
-            await status.delete()
+            try:
+                await status.delete()
+            except Exception:
+                pass
 
         else:
             await status.edit_text(
@@ -544,7 +716,6 @@ async def play_command(client, message):
                 bot_header()
                 + "❌ गाना खोजने या चलाने में समस्या हुई।"
             )
-
         except Exception:
             pass
 
@@ -625,20 +796,29 @@ async def skip_action(chat_id):
     try:
         await calls.leave_call(chat_id)
 
-        current_songs.pop(chat_id, None)
+        old_song = current_songs.pop(chat_id, None)
+
+        if old_song:
+            old_song.clear()
+            del old_song
+
+        memory_cleanup(
+            chat_id,
+            reason="skip"
+        )
+
+        if queues.get(chat_id):
+            success = await play_next(chat_id)
+
+            if success:
+                return True, "⏭️ अगला गाना शुरू हो गया है।"
+
+            return False, "अगला गाना शुरू नहीं हो पाया।"
+
+        return True, "📭 Queue खाली है।"
 
     finally:
         skip_in_progress.discard(chat_id)
-
-    if queues[chat_id]:
-        success = await play_next(chat_id)
-
-        if success:
-            return True, "⏭️ अगला गाना शुरू हो गया है।"
-
-        return False, "अगला गाना शुरू नहीं हो पाया।"
-
-    return True, "📭 Queue खाली है।"
 
 
 @auto_delete_command
@@ -671,9 +851,22 @@ async def stop_action(chat_id):
 
     try:
         queues[chat_id].clear()
-        current_songs.pop(chat_id, None)
 
-        await calls.leave_call(chat_id)
+        old_song = current_songs.pop(chat_id, None)
+
+        if old_song:
+            old_song.clear()
+            del old_song
+
+        try:
+            await calls.leave_call(chat_id)
+        except Exception as error:
+            print(f"⚠️ Leave Call: {error}")
+
+        memory_cleanup(
+            chat_id,
+            reason="stop"
+        )
 
         return True, "⏹️ Playback बंद और Queue साफ कर दी गई है।"
 
@@ -847,7 +1040,6 @@ async def music_callback(client, callback_query):
                 "❌ Action पूरा नहीं हुआ।",
                 show_alert=True
             )
-
         except Exception:
             pass
 
@@ -928,16 +1120,13 @@ async def main():
         )
 
         print("✅ Instant Auto Delete Enabled")
+        print("✅ Memory Cleanup Enabled")
+        print("✅ FloodWait Handling Enabled")
         print("✅ Auto Recovery Enabled")
         print("✅ Music Buttons Registered")
         print("🎵 PANDEY MUSIC BOT ONLINE!")
         print("👑 POWERED BY @The_PANDEY_G")
         print("🌐 Multi-Group Queue Enabled!")
-
-        # Restart के बाद बची हुई Queue को फिर शुरू करने की कोशिश
-        for chat_id in list(queues.keys()):
-            if queues[chat_id]:
-                asyncio.create_task(play_next(chat_id))
 
         await asyncio.Event().wait()
 
@@ -949,12 +1138,18 @@ async def main():
     finally:
         print("🛑 Bot बंद हो रहा है...")
 
-        # Restart के समय current song को Queue में वापस रखें
-        for chat_id, song in list(current_songs.items()):
-            if song:
-                queues[chat_id].appendleft(song)
+        # Shutdown पर current songs और queues के references हटाएँ
+        for song in list(current_songs.values()):
+            if isinstance(song, dict):
+                song.clear()
 
         current_songs.clear()
+
+        for queue in list(queues.values()):
+            queue.clear()
+
+        queues.clear()
+
         playback_starting.clear()
         skip_in_progress.clear()
         stop_in_progress.clear()
@@ -979,6 +1174,13 @@ async def main():
 
         except Exception:
             traceback.print_exc()
+
+        try:
+            http.close()
+        except Exception:
+            pass
+
+        cleanup_all()
 
         bot = None
         user = None
