@@ -2,6 +2,7 @@ import os
 import asyncio
 import traceback
 import time
+import json
 import requests
 import yt_dlp
 import gc
@@ -40,6 +41,9 @@ OWNER_ID_TEXT = os.getenv("OWNER_ID", "").strip()
 SILLYDEV_SERVER_ID = "92eaec77"
 SILLYDEV_API_URL = "https://sillydev.co.uk/panel/api/client"
 
+# Restart status file: restart के बाद भी यह file उपलब्ध रहनी चाहिए।
+RESTART_STATUS_FILE = BASE_DIR / "restart_status.json"
+
 if not API_ID_TEXT.isdigit() or not API_HASH or not BOT_TOKEN:
     raise ValueError("API_ID, API_HASH और BOT_TOKEN .env में जाँचें।")
 
@@ -74,6 +78,64 @@ skip_in_progress = set()
 stop_in_progress = set()
 
 http = requests.Session()
+
+
+# ==================================================
+# RESTART STATUS HELPERS
+# ==================================================
+
+def save_restart_status(chat_id, message_id):
+    """Restart के बाद status message edit करने के लिए IDs सेव करें।"""
+
+    data = {
+        "chat_id": chat_id,
+        "message_id": message_id
+    }
+
+    RESTART_STATUS_FILE.write_text(
+        json.dumps(data),
+        encoding="utf-8"
+    )
+
+
+def clear_restart_status():
+    """Restart status file हटाएँ।"""
+
+    try:
+        RESTART_STATUS_FILE.unlink(missing_ok=True)
+    except Exception as error:
+        print(f"⚠️ Restart status file हट नहीं सकी: {error}")
+
+
+async def update_restart_status(text):
+    """
+    Bot start होने के बाद pending restart message edit करें।
+    Successful तभी लिखा जाएगा जब नया process bot.start() तक पहुँच जाए।
+    """
+
+    if not RESTART_STATUS_FILE.exists():
+        return
+
+    try:
+        data = json.loads(
+            RESTART_STATUS_FILE.read_text(encoding="utf-8")
+        )
+
+        chat_id = int(data["chat_id"])
+        message_id = int(data["message_id"])
+
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text
+        )
+
+        print(f"✅ Restart status updated: {text}")
+
+        clear_restart_status()
+
+    except Exception as error:
+        print(f"⚠️ Restart status update failed: {error}")
 
 
 # ==================================================
@@ -953,6 +1015,27 @@ async def restart_command(client, message):
         )
         return
 
+    if not SILLYDEV_API_KEY:
+        await message.reply_text(
+            "❌ SILLYDEV_API_KEY .env में नहीं मिली।"
+        )
+        return
+
+    # पहले status message भेजें और उसके IDs restart से पहले सेव करें।
+    try:
+        status_message = await message.reply_text(
+            "Pandey Music Bot restarting"
+        )
+
+        save_restart_status(
+            status_message.chat.id,
+            status_message.id
+        )
+
+    except Exception as error:
+        print(f"❌ Restart status save failed: {error}")
+        return
+
     def request_restart():
         return requests.post(
             f"{SILLYDEV_API_URL}/servers/{SILLYDEV_SERVER_ID}/power",
@@ -968,25 +1051,39 @@ async def restart_command(client, message):
     try:
         response = await asyncio.to_thread(request_restart)
 
-        # SillyDev restart request successful
+        # 204 का अर्थ request स्वीकार हुई; यह अपने आप में restart पूरा होने का प्रमाण नहीं।
         if response.status_code == 204:
-            await telegram_send(
-                message.chat.id,
-                "Pandey Music Bot restart successful"
-            )
+            print("🔄 SillyDev restart request accepted.")
             return
 
-        # API key या response body को Telegram पर न दिखाएँ
         print(
             f"❌ SillyDev restart failed: "
             f"HTTP {response.status_code}"
         )
+
+        try:
+            await status_message.edit_text(
+                "Pandey Music Bot restart failed"
+            )
+        except Exception as edit_error:
+            print(f"⚠️ Restart failure message edit failed: {edit_error}")
+
+        clear_restart_status()
 
     except requests.RequestException as error:
         print(
             f"❌ SillyDev restart connection error: "
             f"{type(error).__name__}: {error}"
         )
+
+        try:
+            await status_message.edit_text(
+                "Pandey Music Bot restart failed"
+            )
+        except Exception as edit_error:
+            print(f"⚠️ Restart failure message edit failed: {edit_error}")
+
+        clear_restart_status()
 
 
 # ==================================================
@@ -1143,6 +1240,11 @@ async def main():
     try:
         await bot.start()
         print("✅ Bot Started")
+
+        # Bot सच में Telegram से connect होने के बाद ही successful लिखें।
+        await update_restart_status(
+            "Pandey Music Bot restart successful"
+        )
 
         await user.start()
         print("✅ User Session Started")
