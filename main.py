@@ -73,6 +73,9 @@ calls = None
 queues = defaultdict(deque)
 current_songs = {}
 
+# जिन chats में Loop चालू है, वहाँ track खत्म होने पर वही गाना दोबारा queue होगा।
+loop_enabled = set()
+
 playback_starting = set()
 skip_in_progress = set()
 stop_in_progress = set()
@@ -284,6 +287,12 @@ def music_keyboard(chat_id):
             InlineKeyboardButton(
                 "🔄 Refresh",
                 callback_data=f"music:refresh:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔁 Loop: On" if chat_id in loop_enabled else "🔁 Loop: Off",
+                callback_data=f"music:loop:{chat_id}"
             )
         ],
         [
@@ -644,8 +653,12 @@ async def stream_ended_handler(_, update: StreamEnded):
     old_song = current_songs.pop(chat_id, None)
 
     if old_song:
-        old_song.clear()
-        del old_song
+        if chat_id in loop_enabled:
+            # वही गाना Queue के आगे डालें ताकि खत्म होते ही फिर शुरू हो।
+            queues[chat_id].appendleft(old_song)
+        else:
+            old_song.clear()
+            del old_song
 
     # पुराने track का cleanup
     memory_cleanup(
@@ -688,6 +701,7 @@ async def start_command(client, message):
         + "/stop\n"
         + "/end\n"
         + "/queue\n"
+        + "/loop (Loop On/Off)\n"
         + "/restart",
         disable_web_page_preview=True
     )
@@ -984,6 +998,27 @@ async def end_command(client, message):
 
 
 # ==================================================
+# LOOP
+# ==================================================
+
+@auto_delete_command
+async def loop_command(client, message):
+    chat_id = message.chat.id
+
+    if chat_id in loop_enabled:
+        loop_enabled.discard(chat_id)
+        result = "🔁 Loop बंद कर दिया गया।"
+    else:
+        loop_enabled.add(chat_id)
+        result = "🔁 Loop चालू है। गाना खत्म होते ही वही गाना फिर से चलेगा।"
+
+    await message.reply_text(
+        bot_header() + result,
+        reply_markup=music_keyboard(chat_id)
+    )
+
+
+# ==================================================
 # QUEUE
 # ==================================================
 
@@ -1135,6 +1170,14 @@ async def music_callback(client, callback_query):
         elif action == "end":
             ok, result = await stop_action(target_chat)
 
+        elif action == "loop":
+            if target_chat in loop_enabled:
+                loop_enabled.discard(target_chat)
+                ok, result = True, "🔁 Loop बंद कर दिया गया।"
+            else:
+                loop_enabled.add(target_chat)
+                ok, result = True, "🔁 Loop चालू है।"
+
         elif action in ("queue", "refresh"):
             await callback_query.message.edit_text(
                 queue_text(target_chat),
@@ -1179,13 +1222,19 @@ async def music_callback(client, callback_query):
                     reply_markup=None
                 )
 
-        elif action in ("pause", "resume"):
+        elif action in ("pause", "resume", "loop"):
             current = current_songs.get(target_chat)
 
             if current:
                 await callback_query.message.edit_text(
                     now_playing_text(current),
                     reply_markup=music_keyboard(target_chat)
+                )
+            elif action == "loop":
+                await callback_query.message.edit_text(
+                    queue_text(target_chat),
+                    reply_markup=music_keyboard(target_chat),
+                    disable_web_page_preview=True
                 )
 
     except Exception as error:
@@ -1234,6 +1283,7 @@ async def main():
         ("stop", stop_command),
         ("end", end_command),
         ("queue", queue_command),
+        ("loop", loop_command),
         ("restart", restart_command)
     ]
 
